@@ -54,8 +54,8 @@ def inject_fields(pdf_bytes: bytes) -> bytes:
                     w.border_color = (0.6, 0.6, 0.6); w.fill_color = (1, 1, 1); w.border_width = 0.6
                 else:  # signature
                     w.field_type = fitz.PDF_WIDGET_TYPE_SIGNATURE
-                    w.rect = fitz.Rect(r.x0 - 2, r.y0 - 26, r.x0 + 180, r.y0 + 4)
-                page.add_widget(w)
+                    w.rect = fitz.Rect(r.x0 - 2, r.y0 + 30, r.x0 + 180, r.y0 + 53)
+                    page.add_widget(w)
         # 2) effacer le texte des tags (pour qu'ils ne soient plus visibles)
         for r in redact:
             page.add_redact_annot(r, fill=None)
