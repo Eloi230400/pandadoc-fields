@@ -102,8 +102,10 @@ def _wait_section(doc_id, up_id, key, tries=30):
     return False
 
 
-def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf):
-    """Tache de fond : ajoute la page signature (modele) puis les annexes."""
+def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
+                subject=None, do_send=True):
+    """Tache de fond : ajoute la page signature (modele) puis les annexes,
+    puis ENVOIE le contrat au signataire (plus de brouillon)."""
     job = JOBS.setdefault(doc_id, {})
     try:
         job["stage"] = "wait-body"
@@ -135,7 +137,28 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf):
             else:
                 job.update(stage="error", error=f"add-annexe {ra.status_code}: {ra.text[:300]}"); return
 
-        job["stage"] = "done"
+        # montage termine : le document est un brouillon complet
+        if not do_send:
+            job["stage"] = "done"
+            return
+
+        # ENVOI AUTOMATIQUE : on envoie le contrat au signataire (fini le brouillon)
+        job["stage"] = "send"
+        _wait_draft(doc_id, key)  # s'assurer que le doc est bien pret a etre envoye
+        send_body = {
+            "silent": False,  # False = PandaDoc envoie l'email au signataire
+            "subject": subject or "Votre contrat Arthaud Immobilier Academie",
+            "message": ("Bonjour,\n\nVoici votre contrat a signer electroniquement. "
+                        "Merci de le parcourir, de cocher les 2 cases obligatoires, "
+                        "puis de le signer.\n\nBien a vous,\nArthaud Immobilier Academie"),
+        }
+        sd = requests.post(f"{PANDADOC}/documents/{doc_id}/send",
+                           headers={**_headers(key), "Content-Type": "application/json"},
+                           data=json.dumps(send_body), timeout=90)
+        if sd.status_code >= 400:
+            job.update(stage="error",
+                       error=f"send {sd.status_code}: {sd.text[:300]}"); return
+        job["stage"] = "sent"
     except Exception as e:
         job.update(stage="error", error=str(e), trace=traceback.format_exc()[-500:])
 
@@ -187,12 +210,17 @@ def create_draft():
         doc_id = r.json()["id"]
 
         # 4) Lancer le montage des sections EN TACHE DE FOND et repondre tout de suite
-        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype}
+        #    do_send=True par defaut => le contrat est ENVOYE (pas juste un brouillon).
+        #    Passer "send": false dans le body pour rester en brouillon (tests).
+        do_send = bool(d.get("send", True))
+        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
+                         kwargs={"subject": meta["name"], "do_send": do_send},
                          daemon=True).start()
 
-        return jsonify({"ok": True, "document_id": doc_id, "status": "assembling",
+        return jsonify({"ok": True, "document_id": doc_id,
+                        "status": "assembling+send" if do_send else "assembling",
                         "contract_type": ctype, "signature_page_index": sig_idx,
                         "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
     except Exception as e:
@@ -217,7 +245,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v2)", 200
+    return "Contrat PandaDoc service OK (async v3 - envoi auto)", 200
 
 
 if __name__ == "__main__":
