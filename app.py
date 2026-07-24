@@ -214,14 +214,16 @@ def create_draft():
             return jsonify({"ok": False, "stage": "split", "error": "corps vide"}), 500
 
         # 3) Creer le document PandaDoc a partir du corps (RAPIDE)
-        #    Nom du document : "Contrat – {Produit} – {Prenom Nom}" si produit /
+        #    Nom du document : "Contrat {Produit} - {Prenom Nom}" si produit /
         #    client_nom sont fournis par le Zap ; sinon document_name ; sinon defaut.
         produit = (d.get("produit") or "").strip()
         client_nom = (d.get("client_nom") or "").strip()
         if d.get("document_name"):
             doc_name = d["document_name"]
         elif produit or client_nom:
-            doc_name = " – ".join(["Contrat"] + [p for p in (produit, client_nom) if p])
+            doc_name = ("Contrat " + produit).strip()
+            if client_nom:
+                doc_name += " - " + client_nom
         else:
             doc_name = f"Contrat Mastermind {ctype.upper()}"
         meta = {"name": doc_name,
@@ -270,7 +272,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v5 - envoi auto + nommage Contrat-Produit-Client)", 200
+    return "Contrat PandaDoc service OK (async v6 - nommage 'Contrat Produit - Client')", 200
 
 
 if __name__ == "__main__":
