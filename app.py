@@ -1,116 +1,224 @@
+"""Micro-service "Contrat PandaDoc" — Arthaud Immobilier Académie
+=================================================================
+Assemble un contrat PandaDoc en UN SEUL document, en 3 morceaux :
+  1) le CORPS du contrat = le PDF PDFMonkey (pages AVANT la page signature)
+  2) la PAGE SIGNATURE   = un MODELE PandaDoc natif (2 cases OBLIGATOIRES + signature)
+  3) les ANNEXES         = les pages APRES la page signature (ajoutées en dernier)
+
+Pourquoi un modele natif : PandaDoc ne permet pas de rendre une case obligatoire
+sur un PDF importe. La seule facon d'avoir des cases obligatoires en automatique =
+les mettre dans un MODELE PandaDoc (configure une fois dans l'editeur).
+
+>>> ASYNCHRONE <<<
+Le montage complet cote PandaDoc prend ~70-80 s (traitement async des sections).
+C'est trop long pour une etape Zapier (coupure ~30 s). Donc :
+  - on cree le document (rapide, ~5-10 s) et on renvoie TOUT DE SUITE document_id + edit_url
+  - l'ajout des sections (page signature + annexes) se termine EN TACHE DE FOND.
+Zapier recoit une reponse en ~10 s ; le brouillon finit de s'assembler seul.
+
+ENV requis : PANDADOC_API_KEY
+Endpoint   : POST /create-draft
+  Body JSON : {
+    "pdf_url":            "<URL du PDF PDFMonkey complet>",
+    "contract_type":      "b2b"  ou  "b2c",
+    "client_email":       "...",
+    "client_first_name":  "...",
+    "client_last_name":   "...",
+    "document_name":      "Contrat Mastermind ..."   (optionnel)
+  }
+  -> renvoie {ok, document_id, edit_url} immediatement (brouillon en cours de montage).
+Endpoint   : GET /status/<document_id>  -> etat courant + suivi du montage en fond.
 """
-Micro-service "Champs PandaDoc" — Arthaud Immobilier Académie
--------------------------------------------------------------
-Reçoit l'URL d'un PDF PDFMonkey (contrat déjà rempli), y injecte les VRAIS
-champs de formulaire (1 signature + 2 cases à cocher) aux positions marquées
-par les tags, puis crée le document dans PandaDoc en tant que brouillon avec
-le client positionné comme SIGNATAIRE.
-
-Les positions sont trouvées dynamiquement à partir des marqueurs présents dans
-le PDF :  [signature:client:sig]  [checkbox:client:acces]  [checkbox:client:conditions]
-=> robuste même si la mise en page évolue.
-
-ENV requis :
-    PANDADOC_API_KEY   ta clé API PandaDoc (Paramètres > API et intégrations)
-
-Endpoint :
-    POST /create-draft
-    Body JSON :
-    {
-      "pdf_url": "https://.../contrat.pdf",
-      "document_name": "Contrat Mastermind — V-2026-0332",
-      "client_email": "client@exemple.com",
-      "client_first_name": "Julien",
-      "client_last_name": "Meunier"
-    }
-    Réponse : { "document_id": "...", "status": "...", "edit_url": "..." }
-"""
-import os, io, requests, fitz  # fitz = PyMuPDF
+import os, io, json, time, threading, traceback, requests, fitz
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-PANDADOC_API = "https://api.pandadoc.com/public/v1/documents"
+PANDADOC = "https://api.pandadoc.com/public/v1"
 
-TAGS = {
-    "[signature:client:sig]":         ("signature_client", "signature"),
-    "[checkbox:client:acces]":        ("case_acces",       "checkbox"),
-    "[checkbox:client:conditions]":   ("case_conditions",  "checkbox"),
+# Modeles PandaDoc "page signature" (crees dans l'editeur, cases = OBLIGATOIRES)
+TEMPLATES = {
+    "b2b": "ALxHsnBxvnYiXYUJzfwJmX",
+    "b2c": "pJJCtUi3JxVVKdGmZMwkgL",
 }
+TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
+SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
 
-def inject_fields(pdf_bytes: bytes) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    # 1) repérer chaque tag + poser le widget correspondant
-    for page in doc:
-        redact = []
-        for tag, (name, kind) in TAGS.items():
-            for r in page.search_for(tag):
-                redact.append(r)
-                w = fitz.Widget()
-                w.field_name = name
-                if kind == "checkbox":
-                    w.field_type = fitz.PDF_WIDGET_TYPE_CHECKBOX
-                    w.field_value = False
-                    w.rect = fitz.Rect(r.x0 - 1, r.y0 - 1, r.x0 + 12, r.y0 + 12)
-                    w.border_color = (0.6, 0.6, 0.6); w.fill_color = (1, 1, 1); w.border_width = 0.6
-                else:  # signature
-                    w.field_type = fitz.PDF_WIDGET_TYPE_SIGNATURE
-                    w.rect = fitz.Rect(r.x0 - 2, r.y0 + 30, r.x0 + 180, r.y0 + 53)
-                page.add_widget(w)
-        # 2) effacer le texte des tags (pour qu'ils ne soient plus visibles)
-        for r in redact:
-            page.add_redact_annot(r, fill=None)
-        if redact:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
-                                  graphics=fitz.PDF_REDACT_LINE_ART_NONE)
-    out = io.BytesIO()
-    doc.save(out, garbage=3, deflate=True)
-    return out.getvalue()
+# suivi en memoire du montage en tache de fond (pour /status)
+JOBS = {}
+
+
+def split_body(pdf_bytes: bytes):
+    """Separe le PDF autour de la page signature (reperee par le tag).
+    Retourne (corps_avant_signature, annexes_apres_signature, sig_idx)."""
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    sig_idx = None
+    for i, pg in enumerate(src):
+        if pg.search_for(SIG_TAG):
+            sig_idx = i
+            break
+    if sig_idx is None:
+        sig_idx = src.page_count  # pas de page signature -> tout est corps
+    body = fitz.open()
+    if sig_idx > 0:
+        body.insert_pdf(src, from_page=0, to_page=sig_idx - 1)
+    annexe = fitz.open()
+    if sig_idx + 1 <= src.page_count - 1:
+        annexe.insert_pdf(src, from_page=sig_idx + 1, to_page=src.page_count - 1)
+
+    def dump(dd):
+        if dd.page_count == 0:
+            return None
+        b = io.BytesIO(); dd.save(b, garbage=3, deflate=True); return b.getvalue()
+    return dump(body), dump(annexe), sig_idx
+
+
+def _headers(key):
+    return {"Authorization": f"API-Key {key}"}
+
+
+def _wait_draft(doc_id, key, tries=25):
+    for _ in range(tries):
+        time.sleep(3)
+        try:
+            st = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
+                              headers=_headers(key), timeout=30).json().get("status")
+        except Exception:
+            st = None
+        if st == "document.draft":
+            return True
+    return False
+
+
+def _wait_section(doc_id, up_id, key, tries=30):
+    for _ in range(tries):
+        time.sleep(3)
+        try:
+            st = requests.get(f"{PANDADOC}/documents/{doc_id}/sections/uploads/{up_id}",
+                              headers=_headers(key), timeout=30).json().get("status")
+        except Exception:
+            st = None
+        if st and "PROCESSED" in str(st).upper():
+            return True
+    return False
+
+
+def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf):
+    """Tache de fond : ajoute la page signature (modele) puis les annexes."""
+    job = JOBS.setdefault(doc_id, {})
+    try:
+        job["stage"] = "wait-body"
+        if not _wait_draft(doc_id, key):
+            job.update(stage="error", error="corps pas pret a temps"); return
+
+        # page signature (modele natif, cases obligatoires) -> corps API JSON
+        job["stage"] = "add-signature"
+        sec = {"template_uuid": template_uuid, "name": "Validation & signature",
+               "recipients": [dict(recipient, role=TEMPLATE_ROLE)]}
+        rr = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
+                           headers={**_headers(key), "Content-Type": "application/json"},
+                           data=json.dumps(sec), timeout=90)
+        if rr.status_code >= 400:
+            job.update(stage="error", error=f"add-signature {rr.status_code}: {rr.text[:300]}"); return
+        _wait_section(doc_id, rr.json().get("uuid"), key)
+        _wait_draft(doc_id, key)
+
+        # annexes en DERNIER (section fichier)
+        if annexe_pdf:
+            job["stage"] = "add-annexe"
+            ra = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
+                               headers=_headers(key),
+                               files={"file": ("annexes.pdf", annexe_pdf, "application/pdf")},
+                               data={"data": json.dumps({"name": "Annexes"})}, timeout=90)
+            if ra.status_code < 400:
+                _wait_section(doc_id, ra.json().get("uuid"), key)
+                _wait_draft(doc_id, key)
+            else:
+                job.update(stage="error", error=f"add-annexe {ra.status_code}: {ra.text[:300]}"); return
+
+        job["stage"] = "done"
+    except Exception as e:
+        job.update(stage="error", error=str(e), trace=traceback.format_exc()[-500:])
+
 
 @app.post("/create-draft")
 def create_draft():
-    d = request.get_json(force=True)
-    api_key = os.environ["PANDADOC_API_KEY"]
+    try:
+        d = request.get_json(force=True) or {}
+        key = os.environ.get("PANDADOC_API_KEY")
+        if not key:
+            return jsonify({"ok": False, "stage": "config", "error": "PANDADOC_API_KEY manquante"}), 500
 
-    # a) télécharger le PDF PDFMonkey
-    pdf = requests.get(d["pdf_url"], timeout=60).content
-    # b) injecter les champs natifs
-    pdf = inject_fields(pdf)
+        ctype = (d.get("contract_type") or "b2b").lower()
+        template_uuid = TEMPLATES.get(ctype)
+        if not template_uuid:
+            return jsonify({"ok": False, "stage": "input",
+                            "error": f"contract_type inconnu: {ctype} (attendu b2b ou b2c)"}), 400
+        if not d.get("pdf_url"):
+            return jsonify({"ok": False, "stage": "input", "error": "pdf_url manquant"}), 400
+        if not d.get("client_email"):
+            return jsonify({"ok": False, "stage": "input", "error": "client_email manquant"}), 400
 
-    # c) créer le document PandaDoc depuis le fichier (multipart), champs -> rôle "client"
-    import json
-    meta = {
-        "name": d.get("document_name", "Contrat Mastermind"),
-        "recipients": [{
+        recipient = {
             "email": d["client_email"],
             "first_name": d.get("client_first_name", ""),
             "last_name": d.get("client_last_name", ""),
-            "role": "client",
-        }],
-        "parse_form_fields": True,
-        "fields": {
-            "signature_client": {"role": "client"},
-            "case_acces":       {"role": "client"},
-            "case_conditions":  {"role": "client"},
-        },
-    }
-    r = requests.post(
-        PANDADOC_API,
-        headers={"Authorization": f"API-Key {api_key}"},
-        files={"file": ("contrat.pdf", pdf, "application/pdf")},
-        data={"data": json.dumps(meta)},
-        timeout=90,
-    )
-    r.raise_for_status()
-    doc = r.json()
-    return jsonify({
-        "document_id": doc.get("id"),
-        "status": doc.get("status"),
-        "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc.get('id')}",
-    })
+        }
+
+        # 1) Telecharger le PDF PDFMonkey complet
+        try:
+            pdf = requests.get(d["pdf_url"], timeout=60).content
+        except Exception as e:
+            return jsonify({"ok": False, "stage": "download", "error": str(e)}), 502
+
+        # 2) Corps (avant signature) + annexes (apres signature)
+        body_pdf, annexe_pdf, sig_idx = split_body(pdf)
+        if not body_pdf:
+            return jsonify({"ok": False, "stage": "split", "error": "corps vide"}), 500
+
+        # 3) Creer le document PandaDoc a partir du corps (RAPIDE)
+        meta = {"name": d.get("document_name", f"Contrat Mastermind {ctype.upper()}"),
+                "recipients": [dict(recipient, role="client")]}
+        r = requests.post(f"{PANDADOC}/documents", headers=_headers(key),
+                          files={"file": ("corps.pdf", body_pdf, "application/pdf")},
+                          data={"data": json.dumps(meta)}, timeout=90)
+        if r.status_code >= 400:
+            return jsonify({"ok": False, "stage": "create-body",
+                            "http_status": r.status_code, "error": r.text[:800]}), 502
+        doc_id = r.json()["id"]
+
+        # 4) Lancer le montage des sections EN TACHE DE FOND et repondre tout de suite
+        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype}
+        threading.Thread(target=assemble_bg,
+                         args=(doc_id, key, template_uuid, recipient, annexe_pdf),
+                         daemon=True).start()
+
+        return jsonify({"ok": True, "document_id": doc_id, "status": "assembling",
+                        "contract_type": ctype, "signature_page_index": sig_idx,
+                        "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
+    except Exception as e:
+        return jsonify({"ok": False, "stage": "unhandled",
+                        "error": str(e), "trace": traceback.format_exc()[-800:]}), 500
+
+
+@app.get("/status/<doc_id>")
+def status(doc_id):
+    key = os.environ.get("PANDADOC_API_KEY")
+    pd_status = None
+    if key:
+        try:
+            pd_status = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
+                                     headers=_headers(key), timeout=30).json().get("status")
+        except Exception:
+            pd_status = None
+    return jsonify({"document_id": doc_id, "assembly": JOBS.get(doc_id, {}),
+                    "pandadoc_status": pd_status,
+                    "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
+
 
 @app.get("/")
 def health():
-    return "PandaDoc fields service OK", 200
+    return "Contrat PandaDoc service OK (async v2)", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
