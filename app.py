@@ -272,13 +272,21 @@ def relay_set():
         return jsonify({"ok": False, "error": str(e)}), 502
 
 
+@app.post("/relay-up/<n>")
+def relay_up(n):
+    RELAY[n] = request.get_data()
+    return jsonify({"ok": True, "name": n, "bytes": len(RELAY[n])})
+
+
 @app.get("/relay/<n>")
 def relay_get(n):
     from flask import Response
     c = RELAY.get(n)
     if c is None:
         return jsonify({"ok": False, "error": "inconnu"}), 404
-    return Response(c, mimetype="application/pdf")
+    r = Response(c, mimetype="application/pdf")
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
 
 
 @app.get("/status/<doc_id>")
@@ -298,7 +306,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v7 - nommage 'Contrat Produit - Client')", 200
+    return "Contrat PandaDoc service OK (async v8 - relay-up)", 200
 
 
 if __name__ == "__main__":
