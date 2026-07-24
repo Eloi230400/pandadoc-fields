@@ -255,6 +255,32 @@ def create_draft():
                         "error": str(e), "trace": traceback.format_exc()[-800:]}), 500
 
 
+# Relais temporaire : le navigateur pousse une URL signee, le serveur telecharge,
+# et le fichier est recuperable via GET /relay/<name> (memoire, non persistant).
+RELAY = {}
+
+
+@app.post("/relay")
+def relay_set():
+    d = request.get_json(force=True) or {}
+    u = d.get("url"); n = d.get("name", "f")
+    try:
+        c = requests.get(u, timeout=90).content
+        RELAY[n] = c
+        return jsonify({"ok": True, "name": n, "bytes": len(c)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.get("/relay/<n>")
+def relay_get(n):
+    from flask import Response
+    c = RELAY.get(n)
+    if c is None:
+        return jsonify({"ok": False, "error": "inconnu"}), 404
+    return Response(c, mimetype="application/pdf")
+
+
 @app.get("/status/<doc_id>")
 def status(doc_id):
     key = os.environ.get("PANDADOC_API_KEY")
@@ -272,7 +298,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v6 - nommage 'Contrat Produit - Client')", 200
+    return "Contrat PandaDoc service OK (async v7 - nommage 'Contrat Produit - Client')", 200
 
 
 if __name__ == "__main__":
