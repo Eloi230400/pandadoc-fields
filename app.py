@@ -137,6 +137,21 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
             else:
                 job.update(stage="error", error=f"add-annexe {ra.status_code}: {ra.text[:300]}"); return
 
+        # retirer le prefixe "[DEV]" impose par la cle sandbox (rename en brouillon)
+        job["stage"] = "rename"
+        try:
+            _wait_draft(doc_id, key)
+            cur = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
+                               headers=_headers(key), timeout=30).json()
+            nm = (cur.get("name") or "")
+            if nm.startswith("[DEV]"):
+                requests.patch(f"{PANDADOC}/documents/{doc_id}",
+                               headers={**_headers(key), "Content-Type": "application/json"},
+                               data=json.dumps({"name": nm.replace("[DEV]", "", 1).strip()}),
+                               timeout=30)
+        except Exception:
+            pass  # non bloquant : au pire le prefixe reste
+
         # montage termine : le document est un brouillon complet
         if not do_send:
             job["stage"] = "done"
@@ -245,7 +260,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v3 - envoi auto)", 200
+    return "Contrat PandaDoc service OK (async v4 - envoi auto + sans [DEV])", 200
 
 
 if __name__ == "__main__":
