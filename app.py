@@ -250,6 +250,9 @@ def create_draft():
 
         # Message d'email personnalise (texte historique du zap Mastermind B2C)
         prenom_client = (d.get("client_first_name") or "").strip()
+        if not prenom_client and client_nom:
+            # fallback : 1er mot du nom du contrat ("Eloi TEST" -> "Eloi")
+            prenom_client = client_nom.split()[0]
         closer_prenom = (d.get("closer_prenom") or "").strip()
         programme = "l'Incubateur" if prod_key == "incubateur" else "le Mastermind"
         salutation = f"Bonjour {prenom_client}," if prenom_client else "Bonjour,"
@@ -337,7 +340,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v10 - email personnalise)", 200
+    return "Contrat PandaDoc service OK (async v11 - email personnalise + prenom fallback)", 200
 
 
 if __name__ == "__main__":
