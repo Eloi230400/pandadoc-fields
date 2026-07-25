@@ -37,8 +37,10 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 
 # Modeles PandaDoc "page signature" (crees dans l'editeur, cases = OBLIGATOIRES)
 TEMPLATES = {
-    "b2b": "ALxHsnBxvnYiXYUJzfwJmX",
-    "b2c": "pJJCtUi3JxVVKdGmZMwkgL",
+    "b2b": "ALxHsnBxvnYiXYUJzfwJmX",              # Mastermind B2B (defaut)
+    "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
+    "b2b:incubateur": "9XVuosmrpA8TuG3pFGgR7X",   # Incubateur B2B
+    "b2c:incubateur": "NEGq3mewatksMjKgaUPzfe",   # Incubateur B2C
 }
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
@@ -187,7 +189,12 @@ def create_draft():
             return jsonify({"ok": False, "stage": "config", "error": "PANDADOC_API_KEY manquante"}), 500
 
         ctype = (d.get("contract_type") or "b2b").lower()
-        template_uuid = TEMPLATES.get(ctype)
+        # routage par produit : "Incubateur ..." -> modeles signature Incubateur
+        produit_brut = (d.get("produit") or "").strip().lower()
+        prod_key = "incubateur" if "incubateur" in produit_brut else ""
+        template_uuid = TEMPLATES.get(f"{ctype}:{prod_key}") if prod_key else None
+        if not template_uuid:
+            template_uuid = TEMPLATES.get(ctype)
         if not template_uuid:
             return jsonify({"ok": False, "stage": "input",
                             "error": f"contract_type inconnu: {ctype} (attendu b2b ou b2c)"}), 400
@@ -306,7 +313,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v8 - relay-up)", 200
+    return "Contrat PandaDoc service OK (async v9 - routage produit Incubateur)", 200
 
 
 if __name__ == "__main__":
