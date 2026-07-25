@@ -41,7 +41,35 @@ TEMPLATES = {
     "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
     "b2b:incubateur": "EZgpsbDUidtEEpBTQJaQxL",   # Incubateur B2B v4 (nom client + date, sans encadre)
     "b2c:incubateur": "r85DmX64qKQfFTTtZvsuq9",   # Incubateur B2C v4 (nom client + date, sans encadre)
+    "b2b:formation": "spoAWUWuysMp4oKckbu6LC",    # Formation classique B2B v1
+    "b2c:formation": "MKK6TUSLdmjShEe6tL2CjC",    # Formation classique B2C v1
+    "b2b:starter": "iREzxvQhESHQ6DTtgKTceF",      # Formation Starter B2B v1
+    "b2c:starter": "7NDpbrqUrSNEnSywJgQxWd",      # Formation Starter B2C v1
 }
+
+# libelle du programme utilise dans le corps de l'email d'envoi
+PROGRAMMES = {
+    "incubateur": "l'Incubateur",
+    "starter": "la formation Starter",
+    "formation": "la Formation",
+    "": "le Mastermind",
+}
+
+
+def detect_prod_key(produit_brut: str) -> str:
+    """Deduit la famille de produit a partir du libelle Airtable "Produit".
+    L'ordre compte : "Formation Starter" doit tomber sur "starter", pas sur
+    "formation". "" = Mastermind (comportement historique inchange)."""
+    p = (produit_brut or "").lower()
+    if "incubateur" in p:
+        return "incubateur"
+    if "mastermind" in p:
+        return ""
+    if "starter" in p:
+        return "starter"
+    if "formation" in p or "classique" in p:
+        return "formation"
+    return ""
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
 
@@ -225,7 +253,7 @@ def create_draft():
         ctype = (d.get("contract_type") or "b2b").lower()
         # routage par produit : "Incubateur ..." -> modeles signature Incubateur
         produit_brut = (d.get("produit") or "").strip().lower()
-        prod_key = "incubateur" if "incubateur" in produit_brut else ""
+        prod_key = detect_prod_key(produit_brut)
         # override explicite (tests) : "template_uuid" dans le body
         template_uuid = (d.get("template_uuid") or "").strip() or None
         if not template_uuid:
@@ -295,7 +323,7 @@ def create_draft():
             # fallback : 1er mot du nom du contrat ("Eloi TEST" -> "Eloi")
             prenom_client = client_nom.split()[0]
         closer_prenom = (d.get("closer_prenom") or "").strip()
-        programme = "l'Incubateur" if prod_key == "incubateur" else "le Mastermind"
+        programme = PROGRAMMES.get(prod_key, "le Mastermind")
         salutation = f"Bonjour {prenom_client}," if prenom_client else "Bonjour,"
         if closer_prenom:
             signature_mail = (closer_prenom + "\n"
@@ -326,7 +354,9 @@ def create_draft():
                 from datetime import datetime
                 date_envoi = datetime.utcnow().strftime("%d/%m/%Y")
         prefill = {}
-        if prod_key == "incubateur" or d.get("template_uuid"):
+        # les modeles v4/v1 (Incubateur, Formation, Starter) portent les champs
+        # de fusion client_nom + date_envoi ; les modeles Mastermind historiques non.
+        if prod_key or d.get("template_uuid"):
             if client_nom:
                 prefill["client_nom"] = {"value": client_nom}
             prefill["date_envoi"] = {"value": date_envoi}
@@ -400,7 +430,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v15 - compression PDF + nom client sans encadre + date)", 200
+    return "Contrat PandaDoc service OK (async v16 - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
 
 
 if __name__ == "__main__":
