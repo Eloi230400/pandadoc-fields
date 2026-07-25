@@ -74,6 +74,37 @@ def split_body(pdf_bytes: bytes):
     return dump(body), dump(annexe), sig_idx
 
 
+def compress_pdf(pdf_bytes: bytes):
+    """v15 — Compresse le PDF (images recompressees en JPEG ~120 dpi, polices
+    sous-ensembles, flux degonfles). Objectif : accelerer l'upload PandaDoc et
+    la reception cote client. En cas de probleme, renvoie le PDF d'origine
+    (aucune regression possible)."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            doc.rewrite_images(dpi_threshold=150, dpi_target=120,
+                               quality=75, lossy=True, lossless=True,
+                               bitonal=False, color=True, gray=True)
+        except Exception:
+            pass
+        try:
+            doc.subset_fonts()
+        except Exception:
+            pass
+        b = io.BytesIO()
+        doc.save(b, garbage=4, deflate=True, clean=True)
+        out = b.getvalue()
+        # garde-fou : si le resultat est vide, plus lourd, ou illisible -> original
+        if not out or len(out) >= len(pdf_bytes):
+            return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+        chk = fitz.open(stream=out, filetype="pdf")
+        if chk.page_count != doc.page_count:
+            return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+        return out, len(pdf_bytes), len(out)
+    except Exception:
+        return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+
+
 def _headers(key):
     return {"Authorization": f"API-Key {key}"}
 
@@ -221,6 +252,10 @@ def create_draft():
         except Exception as e:
             return jsonify({"ok": False, "stage": "download", "error": str(e)}), 502
 
+        # 1bis) v15 — Compression du PDF (images 120 dpi JPEG q75, polices
+        #        sous-ensembles). Sans risque : retombe sur l'original si echec.
+        pdf, size_before, size_after = compress_pdf(pdf)
+
         # 2) Corps (avant signature) + annexes (apres signature)
         body_pdf, annexe_pdf, sig_idx = split_body(pdf)
         if not body_pdf:
@@ -307,6 +342,7 @@ def create_draft():
         return jsonify({"ok": True, "document_id": doc_id,
                         "status": "assembling+send" if do_send else "assembling",
                         "contract_type": ctype, "signature_page_index": sig_idx,
+                        "pdf_bytes_before": size_before, "pdf_bytes_after": size_after,
                         "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
     except Exception as e:
         return jsonify({"ok": False, "stage": "unhandled",
@@ -364,7 +400,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v14 - nom client sans encadre + date)", 200
+    return "Contrat PandaDoc service OK (async v15 - compression PDF + nom client sans encadre + date)", 200
 
 
 if __name__ == "__main__":
