@@ -39,8 +39,8 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 TEMPLATES = {
     "b2b": "ALxHsnBxvnYiXYUJzfwJmX",              # Mastermind B2B (defaut)
     "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
-    "b2b:incubateur": "ZSUdt4N3xkeu8TEy3zcYV8",   # Incubateur B2B v3 (signature + nom client)
-    "b2c:incubateur": "a5wKZpKJt2Fcx2SoKxKE3T",   # Incubateur B2C v3 (signature + nom client)
+    "b2b:incubateur": "EZgpsbDUidtEEpBTQJaQxL",   # Incubateur B2B v4 (nom client + date, sans encadre)
+    "b2c:incubateur": "r85DmX64qKQfFTTtZvsuq9",   # Incubateur B2C v4 (nom client + date, sans encadre)
 }
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
@@ -195,7 +195,10 @@ def create_draft():
         # routage par produit : "Incubateur ..." -> modeles signature Incubateur
         produit_brut = (d.get("produit") or "").strip().lower()
         prod_key = "incubateur" if "incubateur" in produit_brut else ""
-        template_uuid = TEMPLATES.get(f"{ctype}:{prod_key}") if prod_key else None
+        # override explicite (tests) : "template_uuid" dans le body
+        template_uuid = (d.get("template_uuid") or "").strip() or None
+        if not template_uuid:
+            template_uuid = TEMPLATES.get(f"{ctype}:{prod_key}") if prod_key else None
         if not template_uuid:
             template_uuid = TEMPLATES.get(ctype)
         if not template_uuid:
@@ -276,13 +279,29 @@ def create_draft():
             f"{signature_mail}"
         )
 
+        # pre-remplissage des champs du modele (nom du client + date d'envoi)
+        # date d'envoi : parametre "date_envoi" (JJ/MM/AAAA) sinon date du jour (Paris)
+        date_envoi = (d.get("date_envoi") or "").strip()
+        if not date_envoi:
+            try:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime
+                date_envoi = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y")
+            except Exception:
+                from datetime import datetime
+                date_envoi = datetime.utcnow().strftime("%d/%m/%Y")
+        prefill = {}
+        if prod_key == "incubateur" or d.get("template_uuid"):
+            if client_nom:
+                prefill["client_nom"] = {"value": client_nom}
+            prefill["date_envoi"] = {"value": date_envoi}
+
         JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
                                  "message": email_message,
-                                 "fields": ({"client_nom": {"value": client_nom}}
-                                            if (prod_key == "incubateur" and client_nom) else None)},
+                                 "fields": (prefill or None)},
                          daemon=True).start()
 
         return jsonify({"ok": True, "document_id": doc_id,
@@ -345,7 +364,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v13 - nom client + polling rapide)", 200
+    return "Contrat PandaDoc service OK (async v14 - nom client sans encadre + date)", 200
 
 
 if __name__ == "__main__":
