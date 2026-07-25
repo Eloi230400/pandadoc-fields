@@ -39,8 +39,8 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 TEMPLATES = {
     "b2b": "ALxHsnBxvnYiXYUJzfwJmX",              # Mastermind B2B (defaut)
     "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
-    "b2b:incubateur": "XBeWmt5E7uAsYfwhzu8GRC",   # Incubateur B2B v2 (signature corrigee)
-    "b2c:incubateur": "z57CXNdjUqafgJAhKh6ZYb",   # Incubateur B2C v2 (signature corrigee)
+    "b2b:incubateur": "ZSUdt4N3xkeu8TEy3zcYV8",   # Incubateur B2B v3 (signature + nom client)
+    "b2c:incubateur": "a5wKZpKJt2Fcx2SoKxKE3T",   # Incubateur B2C v3 (signature + nom client)
 }
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
@@ -78,9 +78,9 @@ def _headers(key):
     return {"Authorization": f"API-Key {key}"}
 
 
-def _wait_draft(doc_id, key, tries=25):
+def _wait_draft(doc_id, key, tries=50):
     for _ in range(tries):
-        time.sleep(3)
+        time.sleep(1.5)
         try:
             st = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
                               headers=_headers(key), timeout=30).json().get("status")
@@ -91,9 +91,9 @@ def _wait_draft(doc_id, key, tries=25):
     return False
 
 
-def _wait_section(doc_id, up_id, key, tries=30):
+def _wait_section(doc_id, up_id, key, tries=60):
     for _ in range(tries):
-        time.sleep(3)
+        time.sleep(1.5)
         try:
             st = requests.get(f"{PANDADOC}/documents/{doc_id}/sections/uploads/{up_id}",
                               headers=_headers(key), timeout=30).json().get("status")
@@ -105,7 +105,7 @@ def _wait_section(doc_id, up_id, key, tries=30):
 
 
 def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
-                subject=None, do_send=True, message=None):
+                subject=None, do_send=True, message=None, fields=None):
     """Tache de fond : ajoute la page signature (modele) puis les annexes,
     puis ENVOIE le contrat au signataire (plus de brouillon)."""
     job = JOBS.setdefault(doc_id, {})
@@ -118,6 +118,9 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
         job["stage"] = "add-signature"
         sec = {"template_uuid": template_uuid, "name": "Validation & signature",
                "recipients": [dict(recipient, role=TEMPLATE_ROLE)]}
+        if fields:
+            # pre-remplit les champs du modele (ex: client_nom sous "LE CLIENT")
+            sec["fields"] = fields
         rr = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
                            headers={**_headers(key), "Content-Type": "application/json"},
                            data=json.dumps(sec), timeout=90)
@@ -277,7 +280,9 @@ def create_draft():
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
-                                 "message": email_message},
+                                 "message": email_message,
+                                 "fields": ({"client_nom": {"value": client_nom}}
+                                            if (prod_key == "incubateur" and client_nom) else None)},
                          daemon=True).start()
 
         return jsonify({"ok": True, "document_id": doc_id,
@@ -340,7 +345,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v12 - templates signature v2)", 200
+    return "Contrat PandaDoc service OK (async v13 - nom client + polling rapide)", 200
 
 
 if __name__ == "__main__":
