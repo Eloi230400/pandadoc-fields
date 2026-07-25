@@ -39,8 +39,8 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 TEMPLATES = {
     "b2b": "ALxHsnBxvnYiXYUJzfwJmX",              # Mastermind B2B (defaut)
     "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
-    "b2b:incubateur": "9XVuosmrpA8TuG3pFGgR7X",   # Incubateur B2B
-    "b2c:incubateur": "NEGq3mewatksMjKgaUPzfe",   # Incubateur B2C
+    "b2b:incubateur": "XBeWmt5E7uAsYfwhzu8GRC",   # Incubateur B2B v2 (signature corrigee)
+    "b2c:incubateur": "z57CXNdjUqafgJAhKh6ZYb",   # Incubateur B2C v2 (signature corrigee)
 }
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
@@ -340,7 +340,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v11 - email personnalise + prenom fallback)", 200
+    return "Contrat PandaDoc service OK (async v12 - templates signature v2)", 200
 
 
 if __name__ == "__main__":
