@@ -105,7 +105,7 @@ def _wait_section(doc_id, up_id, key, tries=30):
 
 
 def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
-                subject=None, do_send=True):
+                subject=None, do_send=True, message=None):
     """Tache de fond : ajoute la page signature (modele) puis les annexes,
     puis ENVOIE le contrat au signataire (plus de brouillon)."""
     job = JOBS.setdefault(doc_id, {})
@@ -165,9 +165,9 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
         send_body = {
             "silent": False,  # False = PandaDoc envoie l'email au signataire
             "subject": subject or "Votre contrat Arthaud Immobilier Academie",
-            "message": ("Bonjour,\n\nVoici votre contrat a signer electroniquement. "
-                        "Merci de le parcourir, de cocher les 2 cases obligatoires, "
-                        "puis de le signer.\n\nBien a vous,\nArthaud Immobilier Academie"),
+            "message": message or ("Bonjour,\n\nVoici votre contrat à signer "
+                                   "électroniquement.\n\nBien cordialement,\n"
+                                   "Arthaud Immobilier Académie"),
         }
         sd = requests.post(f"{PANDADOC}/documents/{doc_id}/send",
                            headers={**_headers(key), "Content-Type": "application/json"},
@@ -247,10 +247,34 @@ def create_draft():
         #    do_send=True par defaut => le contrat est ENVOYE (pas juste un brouillon).
         #    Passer "send": false dans le body pour rester en brouillon (tests).
         do_send = bool(d.get("send", True))
+
+        # Message d'email personnalise (texte historique du zap Mastermind B2C)
+        prenom_client = (d.get("client_first_name") or "").strip()
+        closer_prenom = (d.get("closer_prenom") or "").strip()
+        programme = "l'Incubateur" if prod_key == "incubateur" else "le Mastermind"
+        salutation = f"Bonjour {prenom_client}," if prenom_client else "Bonjour,"
+        if closer_prenom:
+            signature_mail = (closer_prenom + "\n"
+                              "Chargé de recrutement — Arthaud Immobilier Académie")
+        else:
+            signature_mail = "Arthaud Immobilier Académie"
+        email_message = (
+            f"{salutation}\n\n"
+            f"Comme convenu lors de notre échange, je vous adresse votre contrat "
+            f"pour {programme} Arthaud Immobilier.\n\n"
+            "Vous y retrouverez l'ensemble des éléments dont nous avons parlé : "
+            "votre programme, votre échéancier et votre date de démarrage.\n\n"
+            "La signature s'effectue électroniquement, en quelques instants.\n\n"
+            "Je reste à votre disposition pour tout complément d'information.\n\n"
+            "Bien cordialement,\n\n"
+            f"{signature_mail}"
+        )
+
         JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
-                         kwargs={"subject": meta["name"], "do_send": do_send},
+                         kwargs={"subject": meta["name"], "do_send": do_send,
+                                 "message": email_message},
                          daemon=True).start()
 
         return jsonify({"ok": True, "document_id": doc_id,
@@ -313,7 +337,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v9 - routage produit Incubateur)", 200
+    return "Contrat PandaDoc service OK (async v10 - email personnalise)", 200
 
 
 if __name__ == "__main__":
