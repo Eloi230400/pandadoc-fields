@@ -45,6 +45,8 @@ TEMPLATES = {
     "b2c:formation": "MKK6TUSLdmjShEe6tL2CjC",    # Formation classique B2C v1
     "b2b:starter": "iREzxvQhESHQ6DTtgKTceF",      # Formation Starter B2B v1
     "b2c:starter": "7NDpbrqUrSNEnSywJgQxWd",      # Formation Starter B2C v1
+    "b2b:elite": "mcPnAf4rDy9KYvADAjGCNX",   # Mastermind Elite B2B
+    "b2c:elite": "j3KQxcwb2u7ynDKtYfCik2",   # Mastermind Elite B2C
 }
 
 # libelle du programme utilise dans le corps de l'email d'envoi
@@ -52,6 +54,7 @@ PROGRAMMES = {
     "incubateur": "l'Incubateur",
     "starter": "la formation Starter",
     "formation": "la Formation",
+    "elite": "le Mastermind Elite",
     "": "le Mastermind",
 }
 
@@ -61,6 +64,8 @@ def detect_prod_key(produit_brut: str) -> str:
     L'ordre compte : "Formation Starter" doit tomber sur "starter", pas sur
     "formation". "" = Mastermind (comportement historique inchange)."""
     p = (produit_brut or "").lower()
+    if "elite" in p:               # "Mastermind Elite" -> AVANT "mastermind"
+        return "elite"
     if "incubateur" in p:
         return "incubateur"
     if "mastermind" in p:
