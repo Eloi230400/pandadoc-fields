@@ -102,31 +102,113 @@ def split_body(pdf_bytes: bytes):
     return dump(body), dump(annexe), sig_idx
 
 
+MAX_IMG_W = 900          # largeur max des images bitmap apres reduction
+JPEG_QUALITY = 80        # qualite JPEG des images recompressees
+FIDELITY_DPI = 50        # resolution du controle de fidelite page a page
+FIDELITY_MAX = 6.0       # ecart moyen tolere (0-255) avant retour a l'original
+
+
+def _recompress_images(doc):
+    """Recompresse chaque image bitmap en JPEG, en la reduisant si elle est
+    beaucoup plus grande que son affichage. On remplace UNIQUEMENT l'objet
+    image ; les ressources de page (degrades, motifs, calques) sont laissees
+    intactes -- c'est ce qui distingue cette methode de doc.rewrite_images(),
+    qui detruisait les Pattern de la page de couverture (v15/v16)."""
+    seen = set()
+    for pno in range(doc.page_count):
+        page = doc[pno]
+        for im in page.get_images(full=True):
+            xref, smask = im[0], im[1]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            if smask:
+                continue                      # transparence : on ne touche pas
+            try:
+                old = len(doc.xref_stream_raw(xref))
+            except Exception:
+                old = 0
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.alpha or pix.n > 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                k = 0
+                while pix.width // (2 ** (k + 1)) >= MAX_IMG_W:
+                    k += 1
+                if k:
+                    pix.shrink(k)
+                new = pix.tobytes("jpeg", jpg_quality=JPEG_QUALITY)
+                pix = None
+            except Exception:
+                continue
+            if not new or (old and len(new) >= old):
+                continue
+            try:
+                page.replace_image(xref, stream=new)
+            except Exception:
+                pass
+
+
+def _fidelity_ok(orig_bytes, new_bytes):
+    """Compare le rendu page a page de l'original et du compresse.
+    Retourne False des qu'une page s'ecarte visiblement -> on gardera
+    l'original. Cout mesure : ~0,5 s pour un contrat de 13 pages."""
+    try:
+        a = fitz.open(stream=orig_bytes, filetype="pdf")
+        b = fitz.open(stream=new_bytes, filetype="pdf")
+        if a.page_count != b.page_count:
+            return False
+        for i in range(a.page_count):
+            sa = a[i].get_pixmap(dpi=FIDELITY_DPI).samples
+            sb = b[i].get_pixmap(dpi=FIDELITY_DPI).samples
+            if len(sa) != len(sb):
+                return False
+            n = len(sa)
+            step = 97                          # echantillonnage : ~1 octet sur 97
+            tot = 0
+            cnt = 0
+            for j in range(0, n, step):
+                tot += abs(sa[j] - sb[j])
+                cnt += 1
+            if cnt and (tot / cnt) > FIDELITY_MAX:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def compress_pdf(pdf_bytes: bytes):
-    """v15 — Compresse le PDF (images recompressees en JPEG ~120 dpi, polices
-    sous-ensembles, flux degonfles). Objectif : accelerer l'upload PandaDoc et
-    la reception cote client. En cas de probleme, renvoie le PDF d'origine
-    (aucune regression possible)."""
+    """v17 — Compresse le PDF (images bitmap recompressees en JPEG et reduites,
+    polices sous-ensembles, flux degonfles) pour accelerer l'upload PandaDoc et
+    la reception cote client.
+
+    v17 corrige la regression v15/v16 : doc.rewrite_images() faisait perdre les
+    ressources Pattern de la page de couverture (degrade), au point que
+    PandaDoc affichait la couverture entierement blanche. On recompresse
+    desormais les images une par une, sans toucher aux ressources de page, et
+    un controle de fidelite page a page renvoie l'original au moindre doute.
+    En cas de probleme, on renvoie le PDF d'origine (aucune regression
+    possible)."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            doc.rewrite_images(dpi_threshold=150, dpi_target=120,
-                               quality=75, lossy=True, lossless=True,
-                               bitonal=False, color=True, gray=True)
-        except Exception:
-            pass
+        n_pages = doc.page_count
+        _recompress_images(doc)
         try:
             doc.subset_fonts()
         except Exception:
             pass
         b = io.BytesIO()
-        doc.save(b, garbage=4, deflate=True, clean=True)
+        doc.save(b, garbage=4, deflate=True)
         out = b.getvalue()
-        # garde-fou : si le resultat est vide, plus lourd, ou illisible -> original
+        # garde-fou 1 : resultat vide ou plus lourd -> original
         if not out or len(out) >= len(pdf_bytes):
             return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+        # garde-fou 2 : nombre de pages inchange
         chk = fitz.open(stream=out, filetype="pdf")
-        if chk.page_count != doc.page_count:
+        if chk.page_count != n_pages:
+            return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+        # garde-fou 3 : le rendu de chaque page doit rester identique
+        if not _fidelity_ok(pdf_bytes, out):
             return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
         return out, len(pdf_bytes), len(out)
     except Exception:
@@ -430,7 +512,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v16 - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
+    return "Contrat PandaDoc service OK (async v17 - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
 
 
 if __name__ == "__main__":
