@@ -37,8 +37,8 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 
 # Modeles PandaDoc "page signature" (crees dans l'editeur, cases = OBLIGATOIRES)
 TEMPLATES = {
-    "b2b": "ALxHsnBxvnYiXYUJzfwJmX",              # Mastermind B2B (defaut)
-    "b2c": "pJJCtUi3JxVVKdGmZMwkgL",              # Mastermind B2C (defaut)
+    "b2b": "afGExvFvXN22exGNcijGXm",              # Mastermind B2B (defaut)
+    "b2c": "5tWk9eVGxvpu7ddGj5HW6d",              # Mastermind B2C (defaut)
     "b2b:incubateur": "EZgpsbDUidtEEpBTQJaQxL",   # Incubateur B2B v4 (nom client + date, sans encadre)
     "b2c:incubateur": "r85DmX64qKQfFTTtZvsuq9",   # Incubateur B2C v4 (nom client + date, sans encadre)
     "b2b:formation": "spoAWUWuysMp4oKckbu6LC",    # Formation classique B2B v1
