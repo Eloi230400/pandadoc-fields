@@ -37,8 +37,8 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 
 # Modeles PandaDoc "page signature" (crees dans l'editeur, cases = OBLIGATOIRES)
 TEMPLATES = {
-    "b2b": "afGExvFvXN22exGNcijGXm",              # Mastermind B2B (defaut)
-    "b2c": "5tWk9eVGxvpu7ddGj5HW6d",              # Mastermind B2C (defaut)
+    "b2b": "u8jMx9jGwNXFXUK4JDH8uN",              # Mastermind B2B v2 (libelles corriges)
+    "b2c": "9F7HwBwA7QUjhWCUUAn8aj",              # Mastermind B2C v2 (libelles corriges)
     "b2b:incubateur": "EZgpsbDUidtEEpBTQJaQxL",   # Incubateur B2B v4 (nom client + date, sans encadre)
     "b2c:incubateur": "r85DmX64qKQfFTTtZvsuq9",   # Incubateur B2C v4 (nom client + date, sans encadre)
     "b2b:formation": "spoAWUWuysMp4oKckbu6LC",    # Formation classique B2B v1
@@ -441,12 +441,11 @@ def create_draft():
                 from datetime import datetime
                 date_envoi = datetime.utcnow().strftime("%d/%m/%Y")
         prefill = {}
-        # les modeles v4/v1 (Incubateur, Formation, Starter) portent les champs
-        # de fusion client_nom + date_envoi ; les modeles Mastermind historiques non.
-        if prod_key or d.get("template_uuid"):
-            if client_nom:
-                prefill["client_nom"] = {"value": client_nom}
-            prefill["date_envoi"] = {"value": date_envoi}
+        # tous les modeles de page signature (Mastermind v2, Elite, Incubateur v4,
+        # Formation, Starter) portent les champs client_nom + date_envoi.
+        if client_nom:
+            prefill["client_nom"] = {"value": client_nom}
+        prefill["date_envoi"] = {"value": date_envoi}
 
         JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
         threading.Thread(target=assemble_bg,
