@@ -408,8 +408,16 @@ def create_draft():
                 doc_name += " - " + client_nom
         else:
             doc_name = f"Contrat Mastermind {ctype.upper()}"
+        # v19 — metadata "record_id" : CLE DE RECONCILIATION. Le Zap
+        # "PDC — 3. Contrat signe -> Airtable" retrouve la vente via le champ
+        # "Metadata Record Id". Sans elle, la signature ne remonte JAMAIS dans
+        # Airtable (statut "Signe" absent => commissions sous-evaluees).
+        # Le Zap d'envoi passe "record_id" (deja fourni par l'automation Airtable).
+        record_id = (d.get("record_id") or "").strip()
         meta = {"name": doc_name,
                 "recipients": [dict(recipient, role="client")] + cc_recipients}
+        if record_id:
+            meta["metadata"] = {"record_id": record_id}
         r = requests.post(f"{PANDADOC}/documents", headers=_headers(key),
                           files={"file": ("corps.pdf", body_pdf, "application/pdf")},
                           data={"data": json.dumps(meta)}, timeout=90)
@@ -543,7 +551,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v18 - CC closer + tokens - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
+    return "Contrat PandaDoc service OK (async v19 - CC closer + metadata record_id - Mastermind + Incubateur + Formation + Starter + Elite (B2B/B2C))", 200
 
 
 if __name__ == "__main__":
