@@ -251,7 +251,8 @@ def _wait_section(doc_id, up_id, key, tries=60):
 
 
 def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
-                subject=None, do_send=True, message=None, fields=None):
+                subject=None, do_send=True, message=None, fields=None,
+                tokens=None):
     """Tache de fond : ajoute la page signature (modele) puis les annexes,
     puis ENVOIE le contrat au signataire (plus de brouillon)."""
     job = JOBS.setdefault(doc_id, {})
@@ -267,6 +268,11 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
         if fields:
             # pre-remplit les champs du modele (ex: client_nom sous "LE CLIENT")
             sec["fields"] = fields
+        if tokens:
+            # v18 — variables texte statiques [client_nom]/[date_envoi] :
+            # imprimees telles quelles, NON modifiables par le signataire.
+            # Ignorees si le modele ne contient pas la variable (sans danger).
+            sec["tokens"] = tokens
         rr = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
                            headers={**_headers(key), "Content-Type": "application/json"},
                            data=json.dumps(sec), timeout=90)
@@ -361,6 +367,19 @@ def create_draft():
             "last_name": d.get("client_last_name", ""),
         }
 
+        # v18 — CC closer : le vendeur recoit une copie du contrat envoye.
+        # Le Zap passe "closer_email" (lookup "Email vendeur" de la vente).
+        # Sans role ni champ assigne, PandaDoc le traite comme destinataire CC.
+        closer_email = (d.get("closer_email") or "").strip()
+        cc_recipients = []
+        if closer_email and closer_email.lower() != d["client_email"].strip().lower():
+            cc_recipients.append({
+                "email": closer_email,
+                "first_name": (d.get("closer_prenom") or "").strip(),
+                "last_name": "",
+                "recipient_type": "CC",
+            })
+
         # 1) Telecharger le PDF PDFMonkey complet
         try:
             pdf = requests.get(d["pdf_url"], timeout=60).content
@@ -390,7 +409,7 @@ def create_draft():
         else:
             doc_name = f"Contrat Mastermind {ctype.upper()}"
         meta = {"name": doc_name,
-                "recipients": [dict(recipient, role="client")]}
+                "recipients": [dict(recipient, role="client")] + cc_recipients}
         r = requests.post(f"{PANDADOC}/documents", headers=_headers(key),
                           files={"file": ("corps.pdf", body_pdf, "application/pdf")},
                           data={"data": json.dumps(meta)}, timeout=90)
@@ -447,12 +466,20 @@ def create_draft():
             prefill["client_nom"] = {"value": client_nom}
         prefill["date_envoi"] = {"value": date_envoi}
 
+        # v18 — memes valeurs egalement transmises en tokens (variables texte
+        # statiques) pour les modeles qui utilisent [client_nom]/[date_envoi]
+        # au lieu de champs remplissables.
+        sec_tokens = [{"name": "date_envoi", "value": date_envoi}]
+        if client_nom:
+            sec_tokens.append({"name": "client_nom", "value": client_nom})
+
         JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
                                  "message": email_message,
-                                 "fields": (prefill or None)},
+                                 "fields": (prefill or None),
+                                 "tokens": sec_tokens},
                          daemon=True).start()
 
         return jsonify({"ok": True, "document_id": doc_id,
@@ -516,7 +543,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v17 - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
+    return "Contrat PandaDoc service OK (async v18 - CC closer + tokens - Mastermind + Incubateur + Formation + Starter (B2B/B2C))", 200
 
 
 if __name__ == "__main__":
