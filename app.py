@@ -366,6 +366,16 @@ def create_draft():
             "first_name": d.get("client_first_name", ""),
             "last_name": d.get("client_last_name", ""),
         }
+        # v20 — les 10 Zaps n'envoient PAS client_first_name / client_last_name.
+        # Sans nom, PandaDoc cree le signataire "vide" et retombe sur le contact
+        # deja enregistre pour cet email => le CERTIFICAT DE SIGNATURE (derniere
+        # page du PDF signe) affiche un nom errone, alors que le corps du contrat
+        # est correct. On deduit donc prenom/nom de "client_nom".
+        if not recipient["first_name"] and not recipient["last_name"]:
+            _parts = (d.get("client_nom") or "").strip().split()
+            if _parts:
+                recipient["first_name"] = _parts[0]
+                recipient["last_name"] = " ".join(_parts[1:])
 
         # v18 — CC closer : le vendeur recoit une copie du contrat envoye.
         # Le Zap passe "closer_email" (lookup "Email vendeur" de la vente).
@@ -551,7 +561,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v19 - CC closer + metadata record_id - Mastermind + Incubateur + Formation + Starter + Elite (B2B/B2C))", 200
+    return "Contrat PandaDoc service OK (async v20 - CC closer + metadata record_id + nom signataire - Mastermind + Incubateur + Formation + Starter + Elite (B2B/B2C))", 200
 
 
 if __name__ == "__main__":
