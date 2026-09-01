@@ -35,18 +35,28 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 PANDADOC = "https://api.pandadoc.com/public/v1"
 
-# Modeles PandaDoc "page signature" (crees dans l'editeur, cases = OBLIGATOIRES)
+# Modeles PandaDoc "page signature" (crees dans l'editeur).
+# 01/09/2026 : CONSOLIDATION en 3 modeles (page propre 3 cases -> 1-2 facultatives,
+# 3 obligatoire ; B2B = 2 cases dont "j'ai lu et j'accepte" obligatoire). Role "Role 1".
+#   - B2C accompagnement (incubateur/mastermind/elite) : XuztudELSdVshWxWtozxK4
+#   - B2C formation (formation/starter)                : AcoiwPniXp6vJkJdwXoNDi
+#   - B2B (tous programmes)                            : SqyRSvuQ9yEXXF66x9shXL
+# Ancienne table (rollback) : b2b=u8jMx9jGwNXFXUK4JDH8uN b2c=9F7HwBwA7QUjhWCUUAn8aj
+#   b2b:incubateur=EZgpsbDUidtEEpBTQJaQxL b2c:incubateur=r85DmX64qKQfFTTtZvsuq9
+#   b2b:formation=spoAWUWuysMp4oKckbu6LC b2c:formation=MKK6TUSLdmjShEe6tL2CjC
+#   b2b:starter=iREzxvQhESHQ6DTtgKTceF b2c:starter=7NDpbrqUrSNEnSywJgQxWd
+#   b2b:elite=mcPnAf4rDy9KYvADAjGCNX b2c:elite=j3KQxcwb2u7ynDKtYfCik2
 TEMPLATES = {
-    "b2b": "u8jMx9jGwNXFXUK4JDH8uN",              # Mastermind B2B v2 (libelles corriges)
-    "b2c": "9F7HwBwA7QUjhWCUUAn8aj",              # Mastermind B2C v2 (libelles corriges)
-    "b2b:incubateur": "EZgpsbDUidtEEpBTQJaQxL",   # Incubateur B2B v4 (nom client + date, sans encadre)
-    "b2c:incubateur": "r85DmX64qKQfFTTtZvsuq9",   # Incubateur B2C v4 (nom client + date, sans encadre)
-    "b2b:formation": "spoAWUWuysMp4oKckbu6LC",    # Formation classique B2B v1
-    "b2c:formation": "MKK6TUSLdmjShEe6tL2CjC",    # Formation classique B2C v1
-    "b2b:starter": "iREzxvQhESHQ6DTtgKTceF",      # Formation Starter B2B v1
-    "b2c:starter": "7NDpbrqUrSNEnSywJgQxWd",      # Formation Starter B2C v1
-    "b2b:elite": "mcPnAf4rDy9KYvADAjGCNX",   # Mastermind Elite B2B
-    "b2c:elite": "j3KQxcwb2u7ynDKtYfCik2",   # Mastermind Elite B2C
+    "b2b": "SqyRSvuQ9yEXXF66x9shXL",              # B2B consolide (Mastermind)
+    "b2c": "XuztudELSdVshWxWtozxK4",              # B2C accompagnement (Mastermind)
+    "b2b:incubateur": "SqyRSvuQ9yEXXF66x9shXL",   # B2B consolide
+    "b2c:incubateur": "XuztudELSdVshWxWtozxK4",   # B2C accompagnement
+    "b2b:formation": "SqyRSvuQ9yEXXF66x9shXL",    # B2B consolide
+    "b2c:formation": "AcoiwPniXp6vJkJdwXoNDi",    # B2C formation
+    "b2b:starter": "SqyRSvuQ9yEXXF66x9shXL",      # B2B consolide
+    "b2c:starter": "AcoiwPniXp6vJkJdwXoNDi",      # B2C formation (starter)
+    "b2b:elite": "SqyRSvuQ9yEXXF66x9shXL",        # B2B consolide
+    "b2c:elite": "XuztudELSdVshWxWtozxK4",        # B2C accompagnement (elite)
 }
 
 # libelle du programme utilise dans le corps de l'email d'envoi
@@ -561,7 +571,7 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v20 - CC closer + metadata record_id + nom signataire - Mastermind + Incubateur + Formation + Starter + Elite (B2B/B2C))", 200
+    return "Contrat PandaDoc service OK (async v21 - 3 modeles signature consolides: B2C accompagnement + B2C formation + B2B - CC closer + metadata record_id + nom signataire)", 200
 
 
 if __name__ == "__main__":
