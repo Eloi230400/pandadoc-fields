@@ -17,6 +17,8 @@ C'est trop long pour une etape Zapier (coupure ~30 s). Donc :
 Zapier recoit une reponse en ~10 s ; le brouillon finit de s'assembler seul.
 
 ENV requis : PANDADOC_API_KEY
+ENV option : AIRTABLE_TOKEN (lecture seule, base Commercial & Compta) — v22 : permet de
+             pre-cocher les cases de la page signature d'apres la vente (voir plus bas).
 Endpoint   : POST /create-draft
   Body JSON : {
     "pdf_url":            "<URL du PDF PDFMonkey complet>",
@@ -87,6 +89,49 @@ def detect_prod_key(produit_brut: str) -> str:
     return ""
 TEMPLATE_ROLE = "Role 1"            # role defini dans les modeles
 SIG_TAG = "[signature:client:sig]"  # sert a reperer/retirer la page signature du corps
+
+# v22 (08/09/2026) — CASES PRE-RENSEIGNEES D'APRES LA VISIO.
+# Le closer recueille en visio (enregistree) l'accord oral du client sur
+# l'acces immediat et la renonciation "contenus numeriques", et le note dans le
+# formulaire "Envoyer un contrat" -> table Ventes. Le service relit la vente
+# (record_id) et PRE-COCHE les cases du modele signature. Les cases restent
+# assignees au signataire : le client peut les decocher avant de signer (c'est
+# ce qui garde le consentement "expres"). La case "j'ai lu et j'accepte" est
+# toujours pre-cochee (decision Eloi 08/09). Sans jeton Airtable ou en cas
+# d'erreur => aucune case pre-cochee (comportement v21), jamais de blocage.
+AIRTABLE_BASE = "app6xDX8P4RXOpNHB"
+AIRTABLE_VENTES = "tbllDmX5Oyb5mJilB"
+FIELD_ACCES = "Accès immédiat demandé (visio)"
+FIELD_RENONCIATION = "Renonciation rétractation numérique (visio)"
+# noms de champ de fusion (Field ID) des cases dans les 3 modeles PandaDoc
+MERGE_ACCES = "acces"
+MERGE_RENONCIATION = "renonciation"   # modeles B2C uniquement
+MERGE_CONDITIONS = "conditions"
+
+
+def _truthy(v):
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("1", "true", "oui", "yes", "on", "x")
+
+
+def fetch_visio_choices(record_id: str):
+    """Relit la vente Airtable et renvoie {"acces": bool, "renonciation": bool},
+    ou None si indisponible (pas de jeton, erreur reseau, champ absent...)."""
+    token = os.environ.get("AIRTABLE_TOKEN")
+    if not token or not record_id:
+        return None
+    try:
+        r = requests.get(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}/{record_id}",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if r.status_code >= 400:
+            return None
+        f = r.json().get("fields", {})
+        acces = _truthy(f.get(FIELD_ACCES))
+        renonc = _truthy(f.get(FIELD_RENONCIATION)) and acces  # pas de renonciation sans acces immediat
+        return {"acces": acces, "renonciation": renonc}
+    except Exception:
+        return None
 
 # suivi en memoire du montage en tache de fond (pour /status)
 JOBS = {}
@@ -494,6 +539,24 @@ def create_draft():
             prefill["client_nom"] = {"value": client_nom}
         prefill["date_envoi"] = {"value": date_envoi}
 
+        # v22 — cases pre-cochees d'apres les reponses recueillies en visio.
+        # Priorite : valeurs explicites du body (tests / Zap) > lecture Airtable.
+        # Le client garde la main : les cases restent modifiables avant signature.
+        visio = None
+        if "acces_immediat" in d or "renonciation" in d:
+            _a = _truthy(d.get("acces_immediat"))
+            visio = {"acces": _a, "renonciation": _truthy(d.get("renonciation")) and _a,
+                     "source": "body"}
+        else:
+            visio = fetch_visio_choices(record_id)
+            if visio:
+                visio["source"] = "airtable"
+        if visio:
+            prefill[MERGE_ACCES] = {"value": bool(visio["acces"])}
+            if ctype == "b2c":
+                prefill[MERGE_RENONCIATION] = {"value": bool(visio["renonciation"])}
+            prefill[MERGE_CONDITIONS] = {"value": True}
+
         # v18 — memes valeurs egalement transmises en tokens (variables texte
         # statiques) pour les modeles qui utilisent [client_nom]/[date_envoi]
         # au lieu de champs remplissables.
@@ -501,7 +564,8 @@ def create_draft():
         if client_nom:
             sec_tokens.append({"name": "client_nom", "value": client_nom})
 
-        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send}
+        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send,
+                        "visio_choices": visio}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
@@ -513,6 +577,7 @@ def create_draft():
         return jsonify({"ok": True, "document_id": doc_id,
                         "status": "assembling+send" if do_send else "assembling",
                         "contract_type": ctype, "signature_page_index": sig_idx,
+                        "visio_choices": visio,
                         "pdf_bytes_before": size_before, "pdf_bytes_after": size_after,
                         "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
     except Exception as e:
@@ -571,7 +636,10 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    return "Contrat PandaDoc service OK (async v21 - 3 modeles signature consolides: B2C accompagnement + B2C formation + B2B - CC closer + metadata record_id + nom signataire)", 200
+    airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON (cases non pre-cochees)"
+    return ("Contrat PandaDoc service OK (async v22 - cases pre-cochees d'apres la visio, "
+            f"lecture Airtable: {airtable} - 3 modeles signature consolides - CC closer + "
+            "metadata record_id + nom signataire)"), 200
 
 
 if __name__ == "__main__":
