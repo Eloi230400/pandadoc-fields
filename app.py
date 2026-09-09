@@ -107,6 +107,9 @@ FIELD_RENONCIATION = "Renonciation rétractation numérique (visio)"
 MERGE_ACCES = "acces"
 MERGE_RENONCIATION = "renonciation"   # modeles B2C uniquement
 MERGE_CONDITIONS = "conditions"
+# v23 — cases toujours cochees (decision Eloi 09/09). Mettre FORCE_CHECKBOXES=0
+# dans l'environnement Render pour revenir au comportement v22 (lecture Airtable).
+FORCE_CHECKBOXES = os.environ.get("FORCE_CHECKBOXES", "1").strip().lower() not in ("0", "false", "non", "no")
 
 
 def _truthy(v):
@@ -539,18 +542,24 @@ def create_draft():
             prefill["client_nom"] = {"value": client_nom}
         prefill["date_envoi"] = {"value": date_envoi}
 
-        # v22 — cases pre-cochees d'apres les reponses recueillies en visio.
-        # Priorite : valeurs explicites du body (tests / Zap) > lecture Airtable.
-        # Le client garde la main : les cases restent modifiables avant signature.
-        visio = None
-        if "acces_immediat" in d or "renonciation" in d:
-            _a = _truthy(d.get("acces_immediat"))
-            visio = {"acces": _a, "renonciation": _truthy(d.get("renonciation")) and _a,
-                     "source": "body"}
+        # v23 (09/09/2026, decision Eloi) — CASES FORCEES A "OUI" POUR TOUS LES
+        # CONTRATS : acces immediat, renonciation (B2C) et "j'ai lu et j'accepte"
+        # arrivent cochees quoi qu'ait saisi le closer ; elles sont "Champ requis"
+        # dans les 3 modeles PandaDoc, donc le client ne peut pas signer sans.
+        # La lecture Airtable v22 (fetch_visio_choices) est conservee pour un
+        # eventuel retour arriere mais n'est plus consultee.
+        if FORCE_CHECKBOXES:
+            visio = {"acces": True, "renonciation": (ctype == "b2c"), "source": "forced"}
         else:
-            visio = fetch_visio_choices(record_id)
-            if visio:
-                visio["source"] = "airtable"
+            visio = None
+            if "acces_immediat" in d or "renonciation" in d:
+                _a = _truthy(d.get("acces_immediat"))
+                visio = {"acces": _a, "renonciation": _truthy(d.get("renonciation")) and _a,
+                         "source": "body"}
+            else:
+                visio = fetch_visio_choices(record_id)
+                if visio:
+                    visio["source"] = "airtable"
         if visio:
             prefill[MERGE_ACCES] = {"value": bool(visio["acces"])}
             if ctype == "b2c":
@@ -636,10 +645,11 @@ def status(doc_id):
 
 @app.get("/")
 def health():
-    airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON (cases non pre-cochees)"
-    return ("Contrat PandaDoc service OK (async v22 - cases pre-cochees d'apres la visio, "
-            f"lecture Airtable: {airtable} - 3 modeles signature consolides - CC closer + "
-            "metadata record_id + nom signataire)"), 200
+    airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
+    mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
+            else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
+    return (f"Contrat PandaDoc service OK (async v23 - {mode} - 3 modeles signature "
+            "consolides - CC closer + metadata record_id + nom signataire)"), 200
 
 
 if __name__ == "__main__":
