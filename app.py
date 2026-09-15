@@ -17,8 +17,11 @@ C'est trop long pour une etape Zapier (coupure ~30 s). Donc :
 Zapier recoit une reponse en ~10 s ; le brouillon finit de s'assembler seul.
 
 ENV requis : PANDADOC_API_KEY
-ENV option : AIRTABLE_TOKEN (lecture seule, base Commercial & Compta) — v22 : permet de
-             pre-cocher les cases de la page signature d'apres la vente (voir plus bas).
+ENV option : AIRTABLE_TOKEN (base Commercial & Compta) — v22 : permet de pre-cocher les
+             cases de la page signature d'apres la vente (voir plus bas).
+             v24 : le jeton doit aussi pouvoir ECRIRE (scope data.records:write) pour
+             renvoyer dans la vente l'ID du document, le lien de signature du client et
+             le statut reel de l'envoi. Verifier avec GET /airtable-check.
 Endpoint   : POST /create-draft
   Body JSON : {
     "pdf_url":            "<URL du PDF PDFMonkey complet>",
@@ -135,6 +138,144 @@ def fetch_visio_choices(record_id: str):
         return {"acces": acces, "renonciation": renonc}
     except Exception:
         return None
+
+# v24 (15/09/2026) — RETOUR DANS AIRTABLE APRES L'ENVOI REEL.
+# Jusqu'ici le Zap posait "Statut contrat = Envoyé" des que le service acceptait
+# la demande, AVANT le montage et l'envoi PandaDoc (qui durent ~60-90 s en tache
+# de fond). Si le montage mourait en route (ex. Corbanini V-2026-0597 le 15/09 :
+# brouillon jamais envoye), Airtable affichait quand meme "Envoyé" et personne
+# ne le voyait. Et l'ID du document PandaDoc n'etait stocke nulle part : la
+# seule cle etait la metadata record_id cote PandaDoc.
+# Desormais le service ecrit lui-meme dans la vente (record_id) :
+#   - des la creation du document : _PandaDoc ID (permet de retrouver un
+#     brouillon orphelin) ;
+#   - apres l'envoi reel : le lien de signature personnel du client
+#     (recipients[].shared_link du document, le meme que "Partager via un lien"
+#     dans PandaDoc), dans un champ RESERVE A LA DIRECTION (jamais affiche aux
+#     closers/setters : la Direction le transmet au closer, qui l'envoie au
+#     client, et seul le client agit), + Statut contrat = "Envoyé" (confirme) ;
+#   - en cas d'echec du montage/envoi : Statut contrat = "⚠️ Erreur envoi" +
+#     le detail dans "_Envoi contrat — erreur" (visible Direction/closer).
+# Jamais bloquant : sans jeton, sans record_id ou en cas d'erreur Airtable, le
+# contrat part quand meme ; le detail est visible dans GET /status/<doc_id>.
+AT_FIELD_DOC_ID = "_PandaDoc ID"
+AT_FIELD_LINK = "🔒 Lien de signature (client) — Direction"   # visible Direction uniquement (decision Eloi 15/09)
+AT_FIELD_STATUT = "Statut contrat"
+AT_FIELD_ERREUR = "_Envoi contrat — erreur"
+AT_STATUT_ENVOYE = "Envoyé"
+AT_STATUT_ERREUR = "⚠️ Erreur envoi"
+# statuts que l'on ne doit JAMAIS ecraser par "Envoyé" (deja plus avances)
+AT_STATUTS_AVANCES = ("En attente signature", "Lu", "Signé", "Refusé", "Annulé",
+                      "Résilié", "Litige", "Expiré")
+
+
+def _at_headers():
+    token = os.environ.get("AIRTABLE_TOKEN")
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"} if token else None
+
+
+def airtable_get_fields(record_id, fields=None):
+    """Lit une vente. Renvoie le dict "fields" ou None (jamais d'exception)."""
+    h = _at_headers()
+    if not h or not record_id:
+        return None
+    try:
+        params = {}
+        if fields:
+            params = [("fields[]", f) for f in fields]
+        r = requests.get(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}/{record_id}",
+                         headers=h, params=params, timeout=15)
+        if r.status_code >= 400:
+            return None
+        return r.json().get("fields", {})
+    except Exception:
+        return None
+
+
+def airtable_patch(record_id, fields):
+    """Met a jour des champs de la vente. Renvoie (ok, detail). typecast=True :
+    les valeurs de liste deroulante sont acceptees par leur libelle."""
+    h = _at_headers()
+    if not h:
+        return False, "AIRTABLE_TOKEN absent"
+    if not record_id:
+        return False, "record_id absent"
+    try:
+        r = requests.patch(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}/{record_id}",
+                           headers=h, data=json.dumps({"fields": fields, "typecast": True}),
+                           timeout=20)
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}"
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def fetch_client_link(doc_id, key, client_email, tries=6):
+    """Apres l'envoi, relit le document et renvoie le lien de signature
+    personnel du signataire (recipients[].shared_link). PandaDoc le renseigne de
+    facon asynchrone : on reessaie quelques secondes. None si introuvable."""
+    want = (client_email or "").strip().lower()
+    for _ in range(tries):
+        try:
+            det = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
+                               headers=_headers(key), timeout=30).json()
+            best = None
+            for rc in det.get("recipients") or []:
+                if str(rc.get("recipient_type") or "").upper() == "CC":
+                    continue
+                link = rc.get("shared_link")
+                if not link:
+                    continue
+                if (rc.get("email") or "").strip().lower() == want:
+                    return link
+                best = best or link       # signataire sans correspondance email exacte
+            if best:
+                return best
+        except Exception:
+            pass
+        time.sleep(2)
+    return None
+
+
+def report_to_airtable(doc_id, record_id, client_email, key, job):
+    """Ecrit dans la vente le resultat REEL du montage/envoi (voir v24)."""
+    res = {"record_id": record_id}
+    if not record_id:
+        res["skipped"] = "record_id absent"
+        job["airtable"] = res
+        return
+    if not os.environ.get("AIRTABLE_TOKEN"):
+        res["skipped"] = "AIRTABLE_TOKEN absent"
+        job["airtable"] = res
+        return
+    try:
+        stage = job.get("stage")
+        fields = {AT_FIELD_DOC_ID: doc_id}
+        if stage == "sent":
+            link = fetch_client_link(doc_id, key, client_email)
+            res["link"] = link
+            if link:
+                fields[AT_FIELD_LINK] = link
+            fields[AT_FIELD_ERREUR] = ""
+            cur = airtable_get_fields(record_id, [AT_FIELD_STATUT]) or {}
+            statut = (cur.get(AT_FIELD_STATUT) or "").strip()
+            if statut not in AT_STATUTS_AVANCES:
+                fields[AT_FIELD_STATUT] = AT_STATUT_ENVOYE
+            res["statut_avant"] = statut
+        elif stage == "done":
+            # brouillon volontaire (send=false) : rien a signaler
+            fields[AT_FIELD_ERREUR] = ""
+        else:
+            err = f"{stage or 'inconnu'} : {job.get('error') or 'erreur inconnue'}"
+            fields[AT_FIELD_STATUT] = AT_STATUT_ERREUR
+            fields[AT_FIELD_ERREUR] = err[:250]
+        ok, detail = airtable_patch(record_id, fields)
+        res.update(ok=ok, detail=detail, fields=list(fields.keys()))
+    except Exception as e:
+        res.update(ok=False, detail=str(e))
+    job["airtable"] = res
+
 
 # suivi en memoire du montage en tache de fond (pour /status)
 JOBS = {}
@@ -310,10 +451,25 @@ def _wait_section(doc_id, up_id, key, tries=60):
 
 def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
                 subject=None, do_send=True, message=None, fields=None,
-                tokens=None):
+                tokens=None, record_id=None):
     """Tache de fond : ajoute la page signature (modele) puis les annexes,
-    puis ENVOIE le contrat au signataire (plus de brouillon)."""
+    puis ENVOIE le contrat au signataire (plus de brouillon).
+    v24 : quoi qu'il arrive, le resultat reel est ecrit dans la vente Airtable."""
     job = JOBS.setdefault(doc_id, {})
+    try:
+        _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
+                           subject, do_send, message, fields, tokens, job)
+    except Exception as e:
+        job.update(stage="error", error=str(e), trace=traceback.format_exc()[-500:])
+    finally:
+        try:
+            report_to_airtable(doc_id, record_id, recipient.get("email"), key, job)
+        except Exception as e:
+            job["airtable"] = {"ok": False, "detail": str(e)}
+
+
+def _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
+                       subject, do_send, message, fields, tokens, job):
     try:
         job["stage"] = "wait-body"
         if not _wait_draft(doc_id, key):
@@ -494,6 +650,12 @@ def create_draft():
                             "http_status": r.status_code, "error": r.text[:800]}), 502
         doc_id = r.json()["id"]
 
+        # v24 — l'ID du document est ecrit TOUT DE SUITE dans la vente : si le
+        # montage en fond meurt, on retrouve le brouillon orphelin depuis Airtable.
+        at_first = None
+        if record_id:
+            at_first = airtable_patch(record_id, {AT_FIELD_DOC_ID: doc_id})
+
         # 4) Lancer le montage des sections EN TACHE DE FOND et repondre tout de suite
         #    do_send=True par defaut => le contrat est ENVOYE (pas juste un brouillon).
         #    Passer "send": false dans le body pour rester en brouillon (tests).
@@ -574,19 +736,21 @@ def create_draft():
             sec_tokens.append({"name": "client_nom", "value": client_nom})
 
         JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send,
-                        "visio_choices": visio}
+                        "visio_choices": visio, "record_id": record_id or None,
+                        "airtable_doc_id_write": (at_first[1] if at_first else "record_id absent")}
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
                                  "message": email_message,
                                  "fields": (prefill or None),
-                                 "tokens": sec_tokens},
+                                 "tokens": sec_tokens,
+                                 "record_id": record_id},
                          daemon=True).start()
 
         return jsonify({"ok": True, "document_id": doc_id,
                         "status": "assembling+send" if do_send else "assembling",
                         "contract_type": ctype, "signature_page_index": sig_idx,
-                        "visio_choices": visio,
+                        "visio_choices": visio, "record_id": record_id or None,
                         "pdf_bytes_before": size_before, "pdf_bytes_after": size_after,
                         "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
     except Exception as e:
@@ -643,13 +807,46 @@ def status(doc_id):
                     "edit_url": f"https://app.pandadoc.com/a/#/documents/{doc_id}"})
 
 
+@app.get("/airtable-check")
+def airtable_check():
+    """v24 — Verifie, SANS exposer le jeton, que le service peut ecrire dans la
+    base : scopes du jeton (whoami) + acces en lecture a la table Ventes.
+    Le retour Airtable exige le scope data.records:write."""
+    token = os.environ.get("AIRTABLE_TOKEN")
+    if not token:
+        return jsonify({"ok": False, "token": "absent"}), 200
+    out = {"token": "present"}
+    try:
+        w = requests.get("https://api.airtable.com/v0/meta/whoami",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if w.status_code < 400:
+            scopes = w.json().get("scopes") or []
+            out["scopes"] = scopes
+            out["peut_ecrire"] = ("data.records:write" in scopes)
+        else:
+            out["whoami"] = f"HTTP {w.status_code}"
+    except Exception as e:
+        out["whoami"] = str(e)
+    try:
+        r = requests.get(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}",
+                         headers={"Authorization": f"Bearer {token}"},
+                         params={"maxRecords": 1, "fields[]": AT_FIELD_DOC_ID}, timeout=15)
+        out["lecture_ventes"] = "ok" if r.status_code < 400 else f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        out["lecture_ventes"] = str(e)
+    out["ok"] = bool(out.get("peut_ecrire")) and out.get("lecture_ventes") == "ok"
+    out["champs_attendus"] = [AT_FIELD_DOC_ID, AT_FIELD_LINK, AT_FIELD_STATUT, AT_FIELD_ERREUR]
+    return jsonify(out), 200
+
+
 @app.get("/")
 def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v23 - {mode} - 3 modeles signature "
-            "consolides - CC closer + metadata record_id + nom signataire)"), 200
+    return (f"Contrat PandaDoc service OK (async v24 - {mode} - 3 modeles signature "
+            "consolides - CC closer + metadata record_id + nom signataire - retour "
+            f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable})"), 200
 
 
 if __name__ == "__main__":
