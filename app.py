@@ -180,14 +180,16 @@ def airtable_get_fields(record_id, fields=None):
     if not h or not record_id:
         return None
     try:
-        params = {}
-        if fields:
-            params = [("fields[]", f) for f in fields]
+        # NB : l'endpoint "un enregistrement" n'accepte pas fields[] (422) -> on lit
+        # tout l'enregistrement et on filtre ensuite (v24.2).
         r = requests.get(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}/{record_id}",
-                         headers=h, params=params, timeout=15)
+                         headers=h, timeout=15)
         if r.status_code >= 400:
             return None
-        return r.json().get("fields", {})
+        allf = r.json().get("fields", {}) or {}
+        if fields:
+            return {k: allf.get(k) for k in fields}
+        return allf
     except Exception:
         return None
 
@@ -258,11 +260,15 @@ def report_to_airtable(doc_id, record_id, client_email, key, job):
             if link:
                 fields[AT_FIELD_LINK] = link
             fields[AT_FIELD_ERREUR] = ""
-            cur = airtable_get_fields(record_id, [AT_FIELD_STATUT]) or {}
-            statut = (cur.get(AT_FIELD_STATUT) or "").strip()
-            if statut not in AT_STATUTS_AVANCES:
-                fields[AT_FIELD_STATUT] = AT_STATUT_ENVOYE
-            res["statut_avant"] = statut
+            cur = airtable_get_fields(record_id, [AT_FIELD_STATUT])
+            if cur is None:
+                # lecture impossible : on ne touche pas au statut (v24.2)
+                res["statut_avant"] = "(lecture impossible)"
+            else:
+                statut = (cur.get(AT_FIELD_STATUT) or "").strip()
+                if statut not in AT_STATUTS_AVANCES:
+                    fields[AT_FIELD_STATUT] = AT_STATUT_ENVOYE
+                res["statut_avant"] = statut
         elif stage == "done":
             # brouillon volontaire (send=false) : rien a signaler
             fields[AT_FIELD_ERREUR] = ""
@@ -914,7 +920,7 @@ def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v24.1 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v24.2 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
             f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable})"), 200
 
