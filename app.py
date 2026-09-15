@@ -879,12 +879,17 @@ def backfill():
     for rid in ids[:100]:
         item = {"record_id": rid}
         try:
+            # v24.3 — tri descendant = prefixe "-" (le parametre "asc" n'existe
+            # pas dans l'API PandaDoc et faisait echouer la requete en 400)
             r = requests.get(f"{PANDADOC}/documents",
                              headers=_headers(key),
                              params={"metadata_record_id": rid, "count": 20,
-                                     "order_by": "date_created", "asc": "false"},
+                                     "order_by": "-date_created"},
                              timeout=30)
-            docs = (r.json().get("results") or []) if r.status_code < 400 else []
+            if r.status_code >= 400:
+                item["error"] = f"PandaDoc HTTP {r.status_code} : {r.text[:200]}"
+                out.append(item); continue
+            docs = r.json().get("results") or []
             # on ignore les brouillons jamais envoyes ; on prend le plus recent envoye
             sent = [x for x in docs if str(x.get("status") or "") not in ("document.draft", "document.uploaded")]
             doc = (sent or docs or [None])[0]
@@ -920,7 +925,7 @@ def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v24.2 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v24.3 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
             f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable})"), 200
 
