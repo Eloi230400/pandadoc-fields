@@ -820,13 +820,29 @@ def airtable_check():
         w = requests.get("https://api.airtable.com/v0/meta/whoami",
                          headers={"Authorization": f"Bearer {token}"}, timeout=15)
         if w.status_code < 400:
-            scopes = w.json().get("scopes") or []
-            out["scopes"] = scopes
-            out["peut_ecrire"] = ("data.records:write" in scopes)
+            # NB : Airtable ne renvoie "scopes" que pour un jeton OAuth, jamais pour
+            # un jeton d'acces personnel -> le vrai test d'ecriture est ci-dessous.
+            out["scopes"] = w.json().get("scopes")
+            out["whoami"] = "ok"
         else:
             out["whoami"] = f"HTTP {w.status_code}"
     except Exception as e:
         out["whoami"] = str(e)
+    # v24.1 — test d'ecriture reel et sans effet : ?write_test=rec... relit le
+    # champ "_Envoi contrat — erreur" de cette vente et le reecrit a l'identique.
+    rid = (request.args.get("write_test") or "").strip()
+    if rid.startswith("rec"):
+        cur = airtable_get_fields(rid, [AT_FIELD_ERREUR])
+        if cur is None:
+            out["peut_ecrire"] = False
+            out["write_test"] = "lecture de la vente impossible"
+        else:
+            ok, detail = airtable_patch(rid, {AT_FIELD_ERREUR: cur.get(AT_FIELD_ERREUR) or ""})
+            out["peut_ecrire"] = ok
+            out["write_test"] = detail
+    else:
+        out["peut_ecrire"] = None
+        out["write_test"] = "ajouter ?write_test=<record_id d'une vente de test> pour tester l'ecriture"
     try:
         r = requests.get(f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_VENTES}",
                          headers={"Authorization": f"Bearer {token}"},
@@ -834,9 +850,63 @@ def airtable_check():
         out["lecture_ventes"] = "ok" if r.status_code < 400 else f"HTTP {r.status_code}: {r.text[:200]}"
     except Exception as e:
         out["lecture_ventes"] = str(e)
-    out["ok"] = bool(out.get("peut_ecrire")) and out.get("lecture_ventes") == "ok"
+    out["ok"] = (out.get("peut_ecrire") is not False) and out.get("lecture_ventes") == "ok"
     out["champs_attendus"] = [AT_FIELD_DOC_ID, AT_FIELD_LINK, AT_FIELD_STATUT, AT_FIELD_ERREUR]
     return jsonify(out), 200
+
+
+@app.post("/backfill")
+def backfill():
+    """v24.1 — Rattrapage : pour les ventes dont le contrat est parti AVANT la
+    v24 (ou pendant une panne d'ecriture Airtable), retrouve le document
+    PandaDoc via sa metadata record_id et ecrit _PandaDoc ID + lien de
+    signature dans la vente. Ne touche PAS au Statut contrat.
+    Body JSON : {"record_ids": ["rec...", ...], "dry": true|false}
+    Reserve a l'operateur (Eloi) : n'envoie rien, n'ecrit que si dry=false."""
+    key = os.environ.get("PANDADOC_API_KEY")
+    if not key:
+        return jsonify({"ok": False, "error": "PANDADOC_API_KEY manquante"}), 500
+    d = request.get_json(force=True) or {}
+    ids = [str(x).strip() for x in (d.get("record_ids") or []) if str(x).strip().startswith("rec")]
+    dry = bool(d.get("dry", True))
+    out = []
+    for rid in ids[:100]:
+        item = {"record_id": rid}
+        try:
+            r = requests.get(f"{PANDADOC}/documents",
+                             headers=_headers(key),
+                             params={"metadata_record_id": rid, "count": 20,
+                                     "order_by": "date_created", "asc": "false"},
+                             timeout=30)
+            docs = (r.json().get("results") or []) if r.status_code < 400 else []
+            # on ignore les brouillons jamais envoyes ; on prend le plus recent envoye
+            sent = [x for x in docs if str(x.get("status") or "") not in ("document.draft", "document.uploaded")]
+            doc = (sent or docs or [None])[0]
+            if not doc:
+                item["skipped"] = "aucun document PandaDoc avec cette metadata"
+                out.append(item); continue
+            item["document_id"] = doc.get("id"); item["pandadoc_status"] = doc.get("status")
+            item["candidats"] = len(docs)
+            fields = {AT_FIELD_DOC_ID: doc.get("id")}
+            cur = airtable_get_fields(rid, [AT_FIELD_STATUT]) or {}
+            client_email = None
+            if str(doc.get("status") or "") != "document.draft":
+                link = fetch_client_link(doc.get("id"), key, client_email, tries=2)
+                item["link"] = link
+                if link:
+                    fields[AT_FIELD_LINK] = link
+            else:
+                fields[AT_FIELD_ERREUR] = "brouillon PandaDoc jamais envoye (rattrapage)"
+            item["fields"] = list(fields.keys())
+            if dry:
+                item["dry"] = True
+            else:
+                ok, detail = airtable_patch(rid, fields)
+                item.update(ok=ok, detail=detail)
+        except Exception as e:
+            item["error"] = str(e)
+        out.append(item)
+    return jsonify({"ok": True, "dry": dry, "count": len(out), "results": out}), 200
 
 
 @app.get("/")
@@ -844,7 +914,7 @@ def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v24 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v24.1 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
             f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable})"), 200
 
