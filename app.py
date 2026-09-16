@@ -34,7 +34,7 @@ Endpoint   : POST /create-draft
   -> renvoie {ok, document_id, edit_url} immediatement (brouillon en cours de montage).
 Endpoint   : GET /status/<document_id>  -> etat courant + suivi du montage en fond.
 """
-import os, io, json, time, threading, traceback, requests, fitz
+import os, io, gc, json, time, threading, traceback, requests, fitz
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -309,13 +309,36 @@ def split_body(pdf_bytes: bytes):
         if dd.page_count == 0:
             return None
         b = io.BytesIO(); dd.save(b, garbage=3, deflate=True); return b.getvalue()
-    return dump(body), dump(annexe), sig_idx
+    try:
+        return dump(body), dump(annexe), sig_idx
+    finally:                                         # v25 : liberation memoire MuPDF
+        for dd in (body, annexe, src):
+            try:
+                dd.close()
+            except Exception:
+                pass
+        _free_mupdf()
 
 
 MAX_IMG_W = 900          # largeur max des images bitmap apres reduction
 JPEG_QUALITY = 80        # qualite JPEG des images recompressees
 FIDELITY_DPI = 50        # resolution du controle de fidelite page a page
 FIDELITY_MAX = 6.0       # ecart moyen tolere (0-255) avant retour a l'original
+
+
+def _free_mupdf():
+    """v25 — CAUSE DES PLANTAGES "Ran out of memory (used over 512MB)" du 16/09/2026
+    (5 redemarrages dans la journee, contrats en erreur 502 pendant ~1 min a chaque
+    fois) : MuPDF garde en cache ("store") les images decodees de chaque PDF traite
+    (couverture 2400 px = ~11 Mo decodee). Le cache n'est jamais vide entre deux
+    contrats, la memoire grimpe de ~25 Mo par contrat jusqu'a la limite de
+    l'instance. Mesure locale : 20 contrats -> 617 Mo sans purge, 130 Mo avec.
+    On vide donc le cache et on force le ramasse-miettes apres chaque traitement."""
+    try:
+        fitz.TOOLS.store_shrink(100)
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _recompress_images(doc):
@@ -363,6 +386,7 @@ def _fidelity_ok(orig_bytes, new_bytes):
     """Compare le rendu page a page de l'original et du compresse.
     Retourne False des qu'une page s'ecarte visiblement -> on gardera
     l'original. Cout mesure : ~0,5 s pour un contrat de 13 pages."""
+    a = b = None
     try:
         a = fitz.open(stream=orig_bytes, filetype="pdf")
         b = fitz.open(stream=new_bytes, filetype="pdf")
@@ -385,6 +409,12 @@ def _fidelity_ok(orig_bytes, new_bytes):
         return True
     except Exception:
         return False
+    finally:                                         # v25 : liberation memoire MuPDF
+        for dd in (a, b):
+            try:
+                dd.close()
+            except Exception:
+                pass
 
 
 def compress_pdf(pdf_bytes: bytes):
@@ -399,6 +429,7 @@ def compress_pdf(pdf_bytes: bytes):
     un controle de fidelite page a page renvoie l'original au moindre doute.
     En cas de probleme, on renvoie le PDF d'origine (aucune regression
     possible)."""
+    doc = chk = None
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         n_pages = doc.page_count
@@ -410,6 +441,7 @@ def compress_pdf(pdf_bytes: bytes):
         b = io.BytesIO()
         doc.save(b, garbage=4, deflate=True)
         out = b.getvalue()
+        b = None
         # garde-fou 1 : resultat vide ou plus lourd -> original
         if not out or len(out) >= len(pdf_bytes):
             return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
@@ -423,15 +455,82 @@ def compress_pdf(pdf_bytes: bytes):
         return out, len(pdf_bytes), len(out)
     except Exception:
         return pdf_bytes, len(pdf_bytes), len(pdf_bytes)
+    finally:                                         # v25 : liberation memoire MuPDF
+        for dd in (doc, chk):
+            try:
+                dd.close()
+            except Exception:
+                pass
+        _free_mupdf()
 
 
 def _headers(key):
     return {"Authorization": f"API-Key {key}"}
 
 
-def _wait_draft(doc_id, key, tries=50):
-    for _ in range(tries):
-        time.sleep(1.5)
+# v25 — resilience : les appels PandaDoc qui echouent de facon TRANSITOIRE
+# (502/503/504 passerelle, 429 quota, 409 "document isn't ready for a status
+# transition yet") sont rejoues avec un delai croissant au lieu de terminer en
+# "Erreur envoi" (constat du 16/09/2026 : Kalwele = add-signature 502 HTML,
+# Naert = send 409 "please consider implementing a retry"). Chaque echec cote
+# closer coutait 5 a 10 min de re-saisie.
+RETRY_STATUSES = (409, 429, 500, 502, 503, 504)
+RETRY_DELAYS = (3, 6, 12, 20, 30)          # secondes entre deux essais
+
+
+def _pd_post(url, key, job=None, doc_id=None, **kw):
+    """POST PandaDoc avec rejeu automatique. Renvoie la derniere reponse (ou une
+    reponse factice en cas d'exception reseau persistante)."""
+    last = None
+    hdrs = {**_headers(key), **(kw.pop("extra_headers", None) or {})}
+    for i, delay in enumerate(RETRY_DELAYS + (None,)):
+        try:
+            r = requests.post(url, headers=hdrs, **kw)
+            last = r
+            if r.status_code < 400 or r.status_code not in RETRY_STATUSES:
+                return r
+        except Exception as e:                       # coupure reseau / timeout
+            last = _FakeResp(599, str(e))
+        if delay is None:
+            break
+        if job is not None:
+            job["retries"] = job.get("retries", 0) + 1
+            job["last_retry"] = f"HTTP {last.status_code} -> nouvel essai dans {delay}s"
+        if doc_id and last.status_code == 409:
+            _wait_draft(doc_id, key, tries=10)       # "not ready" : on attend le brouillon
+        time.sleep(delay)
+    return last
+
+
+class _FakeResp:
+    def __init__(self, status_code, text):
+        self.status_code, self.text = status_code, text
+
+    def json(self):
+        return {}
+
+
+JOBS_TTL = 2 * 3600        # les suivis de montage sont purges apres 2 h
+RELAY_MAX = 3              # le relais memoire ne garde que les 3 derniers fichiers
+
+
+def _purge_jobs():
+    now = time.time()
+    for k in [k for k, v in JOBS.items() if now - v.get("ts", now) > JOBS_TTL]:
+        JOBS.pop(k, None)
+
+
+POLL_S = 1.0             # v25.1 : intervalle de sondage PandaDoc (1,5 s avant)
+
+
+def _wait_draft(doc_id, key, tries=60):
+    """Attend que le document soit un brouillon pret (statut document.draft).
+    v25.1 : on interroge D'ABORD, on dort ensuite. Avant, chaque appel dormait
+    1,5 s avant meme de regarder, et la chaine en fait 5 -> ~8 s perdus par
+    contrat alors que le document etait deja pret."""
+    for i in range(tries):
+        if i:
+            time.sleep(POLL_S)
         try:
             st = requests.get(f"{PANDADOC}/documents/{doc_id}/details",
                               headers=_headers(key), timeout=30).json().get("status")
@@ -442,9 +541,10 @@ def _wait_draft(doc_id, key, tries=50):
     return False
 
 
-def _wait_section(doc_id, up_id, key, tries=60):
-    for _ in range(tries):
-        time.sleep(1.5)
+def _wait_section(doc_id, up_id, key, tries=90):
+    for i in range(tries):
+        if i:
+            time.sleep(POLL_S)
         try:
             st = requests.get(f"{PANDADOC}/documents/{doc_id}/sections/uploads/{up_id}",
                               headers=_headers(key), timeout=30).json().get("status")
@@ -455,6 +555,32 @@ def _wait_section(doc_id, up_id, key, tries=60):
     return False
 
 
+# v25.1 — chronometrage de bout en bout (objectif Eloi : contrat envoye en < 80 s).
+# Chaque envoi reussi est memorise (30 derniers) et visible dans GET /health.
+LAST_SENDS = []
+LAST_SENDS_MAX = 30
+
+
+def _note_send(doc_id, job):
+    try:
+        t0 = job.get("t0")
+        if not t0:
+            return
+        d = round(time.time() - t0, 1)
+        job["duree_s"] = d
+        from datetime import datetime, timezone
+        LAST_SENDS.append({"quand": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           "document_id": doc_id, "record_id": job.get("record_id"),
+                           "duree_s": d, "creation_s": job.get("creation_s"),
+                           "retries": job.get("retries", 0)})
+        while len(LAST_SENDS) > LAST_SENDS_MAX:
+            LAST_SENDS.pop(0)
+        print(f"[timing] {doc_id} vente={job.get('record_id')} envoye en {d} s "
+              f"(creation {job.get('creation_s')} s, rejeux {job.get('retries', 0)})", flush=True)
+    except Exception:
+        pass
+
+
 def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
                 subject=None, do_send=True, message=None, fields=None,
                 tokens=None, record_id=None):
@@ -462,6 +588,7 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
     puis ENVOIE le contrat au signataire (plus de brouillon).
     v24 : quoi qu'il arrive, le resultat reel est ecrit dans la vente Airtable."""
     job = JOBS.setdefault(doc_id, {})
+    job.setdefault("ts", time.time())
     try:
         _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
                            subject, do_send, message, fields, tokens, job)
@@ -472,6 +599,9 @@ def assemble_bg(doc_id, key, template_uuid, recipient, annexe_pdf,
             report_to_airtable(doc_id, record_id, recipient.get("email"), key, job)
         except Exception as e:
             job["airtable"] = {"ok": False, "detail": str(e)}
+        annexe_pdf = None                            # v25 : memoire rendue au plus tot
+        _purge_jobs()
+        gc.collect()
 
 
 def _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
@@ -493,9 +623,9 @@ def _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
             # imprimees telles quelles, NON modifiables par le signataire.
             # Ignorees si le modele ne contient pas la variable (sans danger).
             sec["tokens"] = tokens
-        rr = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
-                           headers={**_headers(key), "Content-Type": "application/json"},
-                           data=json.dumps(sec), timeout=90)
+        rr = _pd_post(f"{PANDADOC}/documents/{doc_id}/sections/uploads", key, job=job, doc_id=doc_id,
+                      extra_headers={"Content-Type": "application/json"},
+                      data=json.dumps(sec), timeout=90)
         if rr.status_code >= 400:
             job.update(stage="error", error=f"add-signature {rr.status_code}: {rr.text[:300]}"); return
         _wait_section(doc_id, rr.json().get("uuid"), key)
@@ -504,10 +634,10 @@ def _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
         # annexes en DERNIER (section fichier)
         if annexe_pdf:
             job["stage"] = "add-annexe"
-            ra = requests.post(f"{PANDADOC}/documents/{doc_id}/sections/uploads",
-                               headers=_headers(key),
-                               files={"file": ("annexes.pdf", annexe_pdf, "application/pdf")},
-                               data={"data": json.dumps({"name": "Annexes"})}, timeout=90)
+            ra = _pd_post(f"{PANDADOC}/documents/{doc_id}/sections/uploads", key, job=job, doc_id=doc_id,
+                          files={"file": ("annexes.pdf", annexe_pdf, "application/pdf")},
+                          data={"data": json.dumps({"name": "Annexes"})}, timeout=90)
+            annexe_pdf = None                        # v25 : on libere les octets tout de suite
             if ra.status_code < 400:
                 _wait_section(doc_id, ra.json().get("uuid"), key)
                 _wait_draft(doc_id, key)
@@ -544,19 +674,21 @@ def _assemble_and_send(doc_id, key, template_uuid, recipient, annexe_pdf,
                                    "électroniquement.\n\nBien cordialement,\n"
                                    "Arthaud Immobilier Académie"),
         }
-        sd = requests.post(f"{PANDADOC}/documents/{doc_id}/send",
-                           headers={**_headers(key), "Content-Type": "application/json"},
-                           data=json.dumps(send_body), timeout=90)
+        sd = _pd_post(f"{PANDADOC}/documents/{doc_id}/send", key, job=job, doc_id=doc_id,
+                      extra_headers={"Content-Type": "application/json"},
+                      data=json.dumps(send_body), timeout=90)
         if sd.status_code >= 400:
             job.update(stage="error",
                        error=f"send {sd.status_code}: {sd.text[:300]}"); return
         job["stage"] = "sent"
+        _note_send(doc_id, job)                      # v25.1 : chrono de bout en bout
     except Exception as e:
         job.update(stage="error", error=str(e), trace=traceback.format_exc()[-500:])
 
 
 @app.post("/create-draft")
 def create_draft():
+    t0 = time.time()                                 # v25.1 : depart du chrono
     try:
         d = request.get_json(force=True) or {}
         key = os.environ.get("PANDADOC_API_KEY")
@@ -611,10 +743,19 @@ def create_draft():
             })
 
         # 1) Telecharger le PDF PDFMonkey complet
-        try:
-            pdf = requests.get(d["pdf_url"], timeout=60).content
-        except Exception as e:
-            return jsonify({"ok": False, "stage": "download", "error": str(e)}), 502
+        pdf = None
+        for essai in range(3):                       # v25 : 3 essais (PDFMonkey / reseau)
+            try:
+                rp = requests.get(d["pdf_url"], timeout=60)
+                if rp.status_code < 400 and rp.content[:4] == b"%PDF":
+                    pdf = rp.content
+                    break
+                err = f"HTTP {rp.status_code}"
+            except Exception as e:
+                err = str(e)
+            time.sleep(2 * (essai + 1))
+        if pdf is None:
+            return jsonify({"ok": False, "stage": "download", "error": err}), 502
 
         # 1bis) v15 — Compression du PDF (images 120 dpi JPEG q75, polices
         #        sous-ensembles). Sans risque : retombe sur l'original si echec.
@@ -741,9 +882,13 @@ def create_draft():
         if client_nom:
             sec_tokens.append({"name": "client_nom", "value": client_nom})
 
-        JOBS[doc_id] = {"stage": "queued", "contract_type": ctype, "will_send": do_send,
+        _purge_jobs()
+        JOBS[doc_id] = {"stage": "queued", "ts": time.time(), "contract_type": ctype, "will_send": do_send,
                         "visio_choices": visio, "record_id": record_id or None,
-                        "airtable_doc_id_write": (at_first[1] if at_first else "record_id absent")}
+                        "airtable_doc_id_write": (at_first[1] if at_first else "record_id absent"),
+                        "t0": t0, "creation_s": round(time.time() - t0, 1)}   # v25.1 chrono
+        pdf = body_pdf = None                        # v25 : le corps est deja chez PandaDoc
+        gc.collect()
         threading.Thread(target=assemble_bg,
                          args=(doc_id, key, template_uuid, recipient, annexe_pdf),
                          kwargs={"subject": meta["name"], "do_send": do_send,
@@ -776,6 +921,7 @@ def relay_set():
     try:
         c = requests.get(u, timeout=90).content
         RELAY[n] = c
+        _trim_relay()
         return jsonify({"ok": True, "name": n, "bytes": len(c)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
@@ -784,7 +930,15 @@ def relay_set():
 @app.post("/relay-up/<n>")
 def relay_up(n):
     RELAY[n] = request.get_data()
+    _trim_relay()
     return jsonify({"ok": True, "name": n, "bytes": len(RELAY[n])})
+
+
+def _trim_relay():
+    """v25 : le relais est un cache temporaire, pas un stockage — on ne garde
+    que les RELAY_MAX derniers fichiers (sinon la memoire grimpe jusqu'a l'OOM)."""
+    while len(RELAY) > RELAY_MAX:
+        RELAY.pop(next(iter(RELAY)), None)
 
 
 @app.get("/relay/<n>")
@@ -925,9 +1079,29 @@ def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v24.3 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v25.1 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
-            f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable})"), 200
+            f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable} - "
+            "v25: rejeu auto des erreurs PandaDoc transitoires + liberation memoire - "
+            "v25.1: sondage PandaDoc sans attente inutile + chrono des envois, voir /timings)"), 200
+
+
+@app.get("/timings")
+def timings():
+    """v25.1 — Les 30 derniers contrats envoyes avec leur duree de bout en bout
+    (reception de la demande Zapier -> statut 'sent' PandaDoc), en secondes."""
+    try:
+        import statistics
+        d = [x["duree_s"] for x in LAST_SENDS if x.get("duree_s") is not None]
+        stats = {"n": len(d), "mediane_s": round(statistics.median(d), 1) if d else None,
+                 "max_s": max(d) if d else None,
+                 "sous_80s": sum(1 for x in d if x <= 80) if d else 0}
+    except Exception:
+        stats = {}
+    en_cours = {k: {"stage": v.get("stage"), "depuis_s": round(time.time() - v["t0"], 1)}
+                for k, v in JOBS.items() if v.get("t0") and v.get("stage") not in ("sent", "done", "error")}
+    return jsonify({"objectif_s": 80, "stats": stats, "derniers_envois": list(reversed(LAST_SENDS)),
+                    "en_cours": en_cours}), 200
 
 
 if __name__ == "__main__":
