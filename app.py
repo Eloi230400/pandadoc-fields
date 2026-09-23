@@ -478,6 +478,50 @@ RETRY_STATUSES = (409, 429, 500, 502, 503, 504)
 RETRY_DELAYS = (3, 6, 12, 20, 30)          # secondes entre deux essais
 
 
+# v26 (23/09/2026) — RENVOI D'UN CONTRAT : expiration de l'ancien document.
+# Depuis la case "Renvoyer le contrat" (Airtable) et depuis toute nouvelle
+# generation sur une vente qui avait deja un document, PandaDoc se retrouvait
+# avec DEUX documents "sent" pour la meme vente : les deux liens de signature
+# fonctionnaient, le client pouvait signer l'ancien (mauvais nom, mauvais prix).
+# On expire donc l'ancien (statut 11 = Expired) des que le nouveau est cree.
+# PATCH /public/v1/documents/{id}/status  {"status": 11, ...}
+# Garde-fous : on n'expire jamais un document deja termine, paye, refuse,
+# annule ou deja expire ; le client n'est PAS notifie (notify_recipients=False,
+# c'est le nouvel e-mail d'envoi qui fait foi) ; aucune erreur n'est bloquante,
+# elle est seulement tracee dans les logs Render.
+PD_STATUTS_FINAUX = ("document.completed", "document.paid", "document.voided",
+                     "document.declined", "document.expired")
+
+
+def expire_previous_doc(old_doc_id, new_doc_id, key, record_id=""):
+    old_doc_id = (old_doc_id or "").strip()
+    if not old_doc_id or not new_doc_id or old_doc_id == new_doc_id:
+        return
+    try:
+        r = requests.get(f"{PANDADOC}/documents/{old_doc_id}", headers=_headers(key), timeout=20)
+        if r.status_code >= 400:
+            print(f"[expire] {old_doc_id} illisible (HTTP {r.status_code}) - laisse tel quel")
+            return
+        st = (r.json().get("status") or "")
+        if st in PD_STATUTS_FINAUX:
+            print(f"[expire] {old_doc_id} deja en {st} - rien a faire")
+            return
+        note = f"Remplace par le contrat {new_doc_id}"
+        if record_id:
+            note += f" (vente {record_id})"
+        p = requests.patch(f"{PANDADOC}/documents/{old_doc_id}/status",
+                           headers=dict(_headers(key), **{"Content-Type": "application/json"}),
+                           data=json.dumps({"status": 11, "note": note[:255],
+                                            "notify_recipients": False}),
+                           timeout=20)
+        if p.status_code >= 400:
+            print(f"[expire] {old_doc_id} refus HTTP {p.status_code}: {p.text[:200]}")
+        else:
+            print(f"[expire] {old_doc_id} ({st}) -> expire, remplace par {new_doc_id}")
+    except Exception as e:
+        print(f"[expire] {old_doc_id} : {e}")
+
+
 def _pd_post(url, key, job=None, doc_id=None, **kw):
     """POST PandaDoc avec rejeu automatique. Renvoie la derniere reponse (ou une
     reponse factice en cas d'exception reseau persistante)."""
@@ -801,7 +845,16 @@ def create_draft():
         # montage en fond meurt, on retrouve le brouillon orphelin depuis Airtable.
         at_first = None
         if record_id:
+            # v26 — on lit l'ancien "_PandaDoc ID" AVANT de l'ecraser : c'est la
+            # seule trace du document precedent. Sans cela, un renvoi laisse deux
+            # liens de signature valides sur la meme vente.
+            _prev = (airtable_get_fields(record_id, [AT_FIELD_DOC_ID]) or {}).get(AT_FIELD_DOC_ID)
             at_first = airtable_patch(record_id, {AT_FIELD_DOC_ID: doc_id})
+            if _prev:
+                # en tache de fond : n'allonge pas le delai d'envoi (objectif < 80 s)
+                threading.Thread(target=expire_previous_doc,
+                                 args=(_prev, doc_id, key, record_id),
+                                 daemon=True).start()
 
         # 4) Lancer le montage des sections EN TACHE DE FOND et repondre tout de suite
         #    do_send=True par defaut => le contrat est ENVOYE (pas juste un brouillon).
@@ -1079,11 +1132,12 @@ def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
     mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v25.1 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v26 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
             f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable} - "
             "v25: rejeu auto des erreurs PandaDoc transitoires + liberation memoire - "
-            "v25.1: sondage PandaDoc sans attente inutile + chrono des envois, voir /timings)"), 200
+            "v25.1: sondage PandaDoc sans attente inutile + chrono des envois, voir /timings - "
+            "v26: renvoi de contrat - l'ancien document PandaDoc de la vente est expire automatiquement)"), 200
 
 
 @app.get("/timings")
