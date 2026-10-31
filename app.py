@@ -910,7 +910,20 @@ def create_draft():
         # dans les 3 modeles PandaDoc, donc le client ne peut pas signer sans.
         # La lecture Airtable v22 (fetch_visio_choices) est conservee pour un
         # eventuel retour arriere mais n'est plus consultee.
-        if FORCE_CHECKBOXES:
+        # v27 (31/10/2026, decision Eloi) — par famille de contrat :
+        #   - B2C accompagnement (incubateur / mastermind / elite) : les cases
+        #     "acces immediat" et "renonciation" SONT RETIREES du modele PandaDoc
+        #     (XuztudELSdVshWxWtozxK4) ; le client garde son droit de retractation.
+        #     On n'envoie plus que "j'ai lu et j'accepte".
+        #   - B2C formation (formation / starter) : les deux cases restent dans le
+        #     modele mais arrivent DECOCHEES (consentement expres du client, cases
+        #     facultatives dans le modele) ; "j'ai lu et j'accepte" reste cochee.
+        #   - B2B : inchange (acces immediat + "j'ai lu et j'accepte" coches).
+        if ctype == "b2c" and prod_key in ("", "incubateur", "elite"):
+            visio = {"acces": None, "renonciation": None, "source": "v27-accompagnement-sans-cases"}
+        elif ctype == "b2c" and prod_key in ("formation", "starter"):
+            visio = {"acces": False, "renonciation": False, "source": "v27-formation-decochees"}
+        elif FORCE_CHECKBOXES:
             visio = {"acces": True, "renonciation": (ctype == "b2c"), "source": "forced"}
         else:
             visio = None
@@ -923,8 +936,9 @@ def create_draft():
                 if visio:
                     visio["source"] = "airtable"
         if visio:
-            prefill[MERGE_ACCES] = {"value": bool(visio["acces"])}
-            if ctype == "b2c":
+            if visio["acces"] is not None:            # v27 : None = la case n'existe plus dans le modele
+                prefill[MERGE_ACCES] = {"value": bool(visio["acces"])}
+            if ctype == "b2c" and visio["renonciation"] is not None:
                 prefill[MERGE_RENONCIATION] = {"value": bool(visio["renonciation"])}
             prefill[MERGE_CONDITIONS] = {"value": True}
 
@@ -1130,14 +1144,15 @@ def backfill():
 @app.get("/")
 def health():
     airtable = "oui" if os.environ.get("AIRTABLE_TOKEN") else "NON"
-    mode = ("cases TOUJOURS cochees (forcees)" if FORCE_CHECKBOXES
+    mode = ("B2B: cases cochees (forcees)" if FORCE_CHECKBOXES
             else f"cases pre-cochees d'apres la visio, lecture Airtable: {airtable}")
-    return (f"Contrat PandaDoc service OK (async v26 - {mode} - 3 modeles signature "
+    return (f"Contrat PandaDoc service OK (async v27 - {mode} - 3 modeles signature "
             "consolides - CC closer + metadata record_id + nom signataire - retour "
             f"Airtable apres envoi reel: ID doc + lien de signature + statut, jeton Airtable: {airtable} - "
             "v25: rejeu auto des erreurs PandaDoc transitoires + liberation memoire - "
             "v25.1: sondage PandaDoc sans attente inutile + chrono des envois, voir /timings - "
-            "v26: renvoi de contrat - l'ancien document PandaDoc de la vente est expire automatiquement)"), 200
+            "v26: renvoi de contrat - l'ancien document PandaDoc de la vente est expire automatiquement - "
+            "v27: cases retractation par famille: B2C accompagnement sans cases, B2C formation decochees)"), 200
 
 
 @app.get("/timings")
