@@ -43,9 +43,15 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 # Modeles PandaDoc "page signature" (crees dans l'editeur).
 # 01/09/2026 : CONSOLIDATION en 3 modeles (page propre 3 cases -> 1-2 facultatives,
 # 3 obligatoire ; B2B = 2 cases dont "j'ai lu et j'accepte" obligatoire). Role "Role 1".
-#   - B2C accompagnement (incubateur/mastermind/elite) : XuztudELSdVshWxWtozxK4
-#   - B2C formation (formation/starter)                : AcoiwPniXp6vJkJdwXoNDi
-#   - B2B (tous programmes)                            : SqyRSvuQ9yEXXF66x9shXL
+# 31/10/2026 (v27.1, decision Eloi) : nouvelles pages signature B2C, generees depuis
+# PDFMonkey ("PAGE SIGNATURE PANDADOC - B2C ACCOMPAGNEMENT (v27)" / "... FORMATION (v27)")
+# et importees dans PandaDoc avec reconnaissance des balises {checkbox:...}/{signature:...} :
+#   - B2C accompagnement (incubateur/mastermind/elite) : 996khAgyjCCog3FbQDcgSP
+#       une seule case "j'ai lu et j'accepte" (obligatoire) + signature
+#   - B2C formation (formation/starter)                : JdSBCbzcXVmZGbRsxAmVhV
+#       cases "acces" et "renonciation" FACULTATIVES (arrivent decochees), "conditions" obligatoire
+#   - B2B (tous programmes)                            : SqyRSvuQ9yEXXF66x9shXL (inchange)
+# Table v23-v27 (rollback) : b2c=XuztudELSdVshWxWtozxK4 (acc. 3 cases) b2c:formation=AcoiwPniXp6vJkJdwXoNDi
 # Ancienne table (rollback) : b2b=u8jMx9jGwNXFXUK4JDH8uN b2c=9F7HwBwA7QUjhWCUUAn8aj
 #   b2b:incubateur=EZgpsbDUidtEEpBTQJaQxL b2c:incubateur=r85DmX64qKQfFTTtZvsuq9
 #   b2b:formation=spoAWUWuysMp4oKckbu6LC b2c:formation=MKK6TUSLdmjShEe6tL2CjC
@@ -53,15 +59,15 @@ PANDADOC = "https://api.pandadoc.com/public/v1"
 #   b2b:elite=mcPnAf4rDy9KYvADAjGCNX b2c:elite=j3KQxcwb2u7ynDKtYfCik2
 TEMPLATES = {
     "b2b": "SqyRSvuQ9yEXXF66x9shXL",              # B2B consolide (Mastermind)
-    "b2c": "XuztudELSdVshWxWtozxK4",              # B2C accompagnement (Mastermind)
+    "b2c": "996khAgyjCCog3FbQDcgSP",              # B2C accompagnement v27 (Mastermind)
     "b2b:incubateur": "SqyRSvuQ9yEXXF66x9shXL",   # B2B consolide
-    "b2c:incubateur": "XuztudELSdVshWxWtozxK4",   # B2C accompagnement
+    "b2c:incubateur": "996khAgyjCCog3FbQDcgSP",   # B2C accompagnement v27
     "b2b:formation": "SqyRSvuQ9yEXXF66x9shXL",    # B2B consolide
-    "b2c:formation": "AcoiwPniXp6vJkJdwXoNDi",    # B2C formation
+    "b2c:formation": "JdSBCbzcXVmZGbRsxAmVhV",    # B2C formation v27
     "b2b:starter": "SqyRSvuQ9yEXXF66x9shXL",      # B2B consolide
-    "b2c:starter": "AcoiwPniXp6vJkJdwXoNDi",      # B2C formation (starter)
+    "b2c:starter": "JdSBCbzcXVmZGbRsxAmVhV",      # B2C formation v27 (starter)
     "b2b:elite": "SqyRSvuQ9yEXXF66x9shXL",        # B2B consolide
-    "b2c:elite": "XuztudELSdVshWxWtozxK4",        # B2C accompagnement (elite)
+    "b2c:elite": "996khAgyjCCog3FbQDcgSP",        # B2C accompagnement v27 (elite)
 }
 
 # libelle du programme utilise dans le corps de l'email d'envoi
@@ -1152,7 +1158,8 @@ def health():
             "v25: rejeu auto des erreurs PandaDoc transitoires + liberation memoire - "
             "v25.1: sondage PandaDoc sans attente inutile + chrono des envois, voir /timings - "
             "v26: renvoi de contrat - l'ancien document PandaDoc de la vente est expire automatiquement - "
-            "v27: cases retractation par famille: B2C accompagnement sans cases, B2C formation decochees)"), 200
+            "v27: cases retractation par famille: B2C accompagnement sans cases, B2C formation decochees - "
+            "v27.1: nouvelles pages signature PandaDoc B2C 996khAgyjCCog3FbQDcgSP / JdSBCbzcXVmZGbRsxAmVhV)"), 200
 
 
 @app.get("/timings")
